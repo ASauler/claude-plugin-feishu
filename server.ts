@@ -248,6 +248,294 @@ async function sendText(chatId: string, text: string): Promise<string> {
   return (res as any)?.data?.message_id ?? ''
 }
 
+// ---------------------------------------------------------------------------
+// CardKit streaming — the heart of the "typewriter" UX
+// ---------------------------------------------------------------------------
+/**
+ * Per-chat card state. One active card per chat; if a new user message
+ * arrives before the previous card finalizes, we finalize the old one
+ * first (as "abandoned") and start a fresh one.
+ */
+type CardState = {
+  cardId: string
+  userMessageId: string       // for typing reaction add/remove
+  answerBuffer: string        // cumulative answer text
+  timelineBuffer: string      // cumulative timeline markdown
+  sequence: number            // CardKit monotonically increasing seq
+  flushTimer: NodeJS.Timeout | null
+  finalized: boolean
+  startedAt: number
+}
+const activeCards = new Map<string, CardState>() // chatId → state
+
+const STREAMING_THINKING_HEADER = '🧐 沃嫩蝶 · 思考中'
+const STREAMING_RUNNING_HEADER = '⚡ 沃嫩蝶 · 执行中'
+const STREAMING_DONE_HEADER = '✨ 沃嫩蝶 · 完成'
+const STREAMING_ERROR_HEADER = '😵 沃嫩蝶 · 失败'
+
+function placeholderCardJSON(): any {
+  return {
+    schema: '2.0',
+    header: {
+      title: { tag: 'plain_text', content: STREAMING_THINKING_HEADER },
+      template: 'blue',
+    },
+    body: {
+      direction: 'vertical',
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: 'answer',
+          content: '…',
+        },
+        {
+          tag: 'collapsible_panel',
+          expanded: false,
+          element_id: 'timeline_panel',
+          header: {
+            title: { tag: 'markdown', content: '💭 过程' },
+          },
+          elements: [
+            {
+              tag: 'markdown',
+              element_id: 'timeline',
+              content: '_等待工具调用…_',
+            },
+          ],
+        },
+      ],
+    },
+  }
+}
+
+function finalCardJSON(params: {
+  answer: string
+  timeline: string
+  elapsedMs: number
+  state: 'done' | 'error'
+}): any {
+  const { answer, timeline, elapsedMs, state } = params
+  const header = state === 'done' ? STREAMING_DONE_HEADER : STREAMING_ERROR_HEADER
+  const template = state === 'done' ? 'green' : 'red'
+  return {
+    schema: '2.0',
+    header: {
+      title: { tag: 'plain_text', content: header },
+      template,
+    },
+    body: {
+      direction: 'vertical',
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: 'answer',
+          content: answer || '（无输出）',
+        },
+        {
+          tag: 'collapsible_panel',
+          expanded: false,
+          element_id: 'timeline_panel',
+          header: {
+            title: { tag: 'markdown', content: `💭 过程` },
+          },
+          elements: [
+            {
+              tag: 'markdown',
+              element_id: 'timeline',
+              content: timeline || '_（无工具调用）_',
+            },
+          ],
+        },
+        { tag: 'hr' },
+        {
+          tag: 'note',
+          elements: [
+            {
+              tag: 'plain_text',
+              content: `⏱ ${(elapsedMs / 1000).toFixed(1)}s`,
+            },
+          ],
+        },
+      ],
+    },
+  }
+}
+
+/** Create a streaming card via CardKit, return card_id. */
+async function createStreamingCard(): Promise<string | null> {
+  try {
+    const res: any = await (client as any).cardkit.v1.card.create({
+      data: {
+        type: 'card_json',
+        data: JSON.stringify(placeholderCardJSON()),
+      },
+    })
+    const cardId = res?.data?.card_id ?? res?.card_id ?? null
+    dlog('cardkit card.create', { cardId, code: res?.code })
+    return cardId
+  } catch (err) {
+    dlog('cardkit card.create FAILED', String(err))
+    return null
+  }
+}
+
+/** Send the card as an IM message — binds cardId to a chat. Returns im message_id. */
+async function sendCardToChat(chatId: string, cardId: string): Promise<string> {
+  const res: any = await client.im.message.create({
+    params: { receive_id_type: 'chat_id' },
+    data: {
+      receive_id: chatId,
+      msg_type: 'interactive',
+      content: JSON.stringify({ type: 'card', data: { card_id: cardId } }),
+    },
+  })
+  return res?.data?.message_id ?? ''
+}
+
+/** Stream cumulative content to a named element via CardKit. */
+async function streamToElement(
+  cardId: string,
+  elementId: string,
+  cumulativeContent: string,
+  sequence: number
+): Promise<void> {
+  try {
+    await (client as any).cardkit.v1.cardElement.content({
+      path: { card_id: cardId, element_id: elementId },
+      data: { content: cumulativeContent, sequence },
+    })
+  } catch (err) {
+    dlog('cardkit cardElement.content FAILED', {
+      elementId,
+      sequence,
+      err: String(err),
+    })
+  }
+}
+
+/** Fully replace a card (used for the final "done" state). */
+async function replaceCard(
+  cardId: string,
+  cardJson: any,
+  sequence: number
+): Promise<void> {
+  try {
+    await (client as any).cardkit.v1.card.update({
+      path: { card_id: cardId },
+      data: {
+        card: { type: 'card_json', data: JSON.stringify(cardJson) },
+        sequence,
+      },
+    })
+  } catch (err) {
+    dlog('cardkit card.update FAILED', { sequence, err: String(err) })
+  }
+}
+
+/** Add a "typing" emoji reaction to the user's message (visual ACK). */
+async function addTypingReaction(messageId: string): Promise<string | null> {
+  try {
+    const res: any = await client.im.messageReaction.create({
+      path: { message_id: messageId },
+      data: { reaction_type: { emoji_type: 'Typing' } },
+    })
+    return res?.data?.reaction_id ?? null
+  } catch (err) {
+    dlog('messageReaction.create(Typing) FAILED', String(err))
+    return null
+  }
+}
+
+/** Remove the typing reaction. Best-effort. */
+async function removeTypingReaction(
+  messageId: string,
+  reactionId: string | null
+): Promise<void> {
+  if (!reactionId) return
+  try {
+    await client.im.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    })
+  } catch (err) {
+    dlog('messageReaction.delete FAILED', String(err))
+  }
+}
+
+/**
+ * Ensure an active card exists for this chat. Creates one if missing.
+ * Returns state object.
+ */
+async function ensureCard(
+  chatId: string,
+  userMessageId: string
+): Promise<CardState | null> {
+  const existing = activeCards.get(chatId)
+  if (existing && !existing.finalized) return existing
+
+  const cardId = await createStreamingCard()
+  if (!cardId) return null
+  await sendCardToChat(chatId, cardId)
+  const state: CardState = {
+    cardId,
+    userMessageId,
+    answerBuffer: '',
+    timelineBuffer: '',
+    sequence: 1,
+    flushTimer: null,
+    finalized: false,
+    startedAt: Date.now(),
+  }
+  activeCards.set(chatId, state)
+  return state
+}
+
+/**
+ * Schedule a flush of both answer + timeline to the card (200ms debounce).
+ * If already scheduled, coalesce.
+ */
+function scheduleFlush(chatId: string): void {
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  if (state.flushTimer) return
+  state.flushTimer = setTimeout(() => {
+    state.flushTimer = null
+    flushCard(chatId).catch(err => dlog('flushCard err', String(err)))
+  }, 200)
+}
+
+async function flushCard(chatId: string): Promise<void> {
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  const seq1 = state.sequence++
+  const seq2 = state.sequence++
+  await streamToElement(state.cardId, 'answer', state.answerBuffer || '_思考中…_', seq1)
+  if (state.timelineBuffer) {
+    await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seq2)
+  }
+}
+
+async function finalizeCard(
+  chatId: string,
+  status: 'done' | 'error' = 'done'
+): Promise<void> {
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  state.finalized = true
+  if (state.flushTimer) {
+    clearTimeout(state.flushTimer)
+    state.flushTimer = null
+  }
+  const seq = state.sequence++
+  const cardJson = finalCardJSON({
+    answer: state.answerBuffer,
+    timeline: state.timelineBuffer,
+    elapsedMs: Date.now() - state.startedAt,
+    state: status,
+  })
+  await replaceCard(state.cardId, cardJson, seq)
+  activeCards.delete(chatId)
+}
+
 /**
  * Send an interactive card with yes/no buttons for permission prompts.
  * Falls back to text on error.
@@ -346,18 +634,24 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: 'reply',
       description:
-        'Send a message back to a Feishu chat. Supports plain text. ' +
-        'Call this for every outbound response; the tag gives you the chat_id.',
+        '**PREFERRED way to reply to Feishu messages.** When a message arrived via ' +
+        '<channel source="feishu"> and you want to respond, ALWAYS use this tool — ' +
+        'NOT im.v1.message.create or any lark-mcp messaging tool. This tool streams ' +
+        'your text into a pre-created card with a native typewriter animation, shows ' +
+        'progress/completion states (🧐→⚡→✨), and manages the conversation UX. ' +
+        'Supports lark_md markdown (headings, bold, italic, code blocks, lists, links).',
       inputSchema: {
         type: 'object',
         properties: {
           chat_id: {
             type: 'string',
-            description: 'The Feishu chat_id from the inbound <channel> tag.',
+            description: 'The Feishu chat_id from the inbound <channel> tag (required).',
           },
           text: {
             type: 'string',
-            description: 'The message text. Markdown supported.',
+            description:
+              'Your final reply. Markdown supported (lark_md flavor). ' +
+              'Can be long — the card handles rendering.',
           },
         },
         required: ['chat_id', 'text'],
@@ -372,7 +666,29 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       chat_id: string
       text: string
     }
+    dlog('=== reply tool called ===', {
+      chat_id,
+      text_len: text?.length ?? 0,
+      has_active_card: activeCards.has(chat_id),
+    })
     try {
+      const state = activeCards.get(chat_id)
+      if (state && !state.finalized) {
+        // Stream final answer into the already-created card.
+        dlog('streaming reply into active card', { cardId: state.cardId })
+        state.answerBuffer = text
+        await flushCard(chat_id)
+        await finalizeCard(chat_id, 'done')
+        dlog('card finalized')
+        // Remove typing reaction (best-effort; reaction_id tracked per chat).
+        const reactionId = typingReactionsByChat.get(chat_id) ?? null
+        if (reactionId && state.userMessageId) {
+          await removeTypingReaction(state.userMessageId, reactionId)
+          typingReactionsByChat.delete(chat_id)
+        }
+        return { content: [{ type: 'text', text: `sent (card finalized)` }] }
+      }
+      // Fallback: no active card, send as plain text.
       const msgId = await sendText(chat_id, text)
       return {
         content: [{ type: 'text', text: `sent (message_id=${msgId})` }],
@@ -388,6 +704,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
   }
   throw new Error(`unknown tool: ${req.params.name}`)
 })
+
+/** Per-chat typing reaction IDs, so we can remove them on reply. */
+const typingReactionsByChat = new Map<string, string>()
 
 // Permission relay: Claude Code → Feishu (card prompt)
 const PermissionRequestSchema = z.object({
@@ -516,6 +835,20 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       defaultHomeChat = chatId
       // Any outstanding permission_request without a mapped chat: assign this one.
       // Best-effort; permission_request arrives asynchronously from Claude Code.
+
+      // ---- UX: acknowledge with typing reaction + placeholder card ----
+      const userMsgId: string = msg.message_id ?? ''
+      if (userMsgId) {
+        // Finalize any previous lingering card (abandoned convo).
+        if (activeCards.has(chatId)) {
+          await finalizeCard(chatId, 'done')
+        }
+        // Typing emoji reaction on user's msg (visual ACK).
+        const reactionId = await addTypingReaction(userMsgId)
+        if (reactionId) typingReactionsByChat.set(chatId, reactionId)
+        // Create streaming placeholder card — answer element will typewriter in.
+        await ensureCard(chatId, userMsgId)
+      }
 
       // ---- Forward to Claude as channel event ----
       dlog('>>> emitting notifications/claude/channel', { chatId, text_prefix: text.slice(0, 40) })
