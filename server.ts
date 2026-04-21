@@ -276,32 +276,20 @@ const STREAMING_ERROR_HEADER = '😵 沃嫩蝶 · 失败'
 function placeholderCardJSON(): any {
   return {
     schema: '2.0',
+    config: {
+      streaming_mode: true, // KEY: enables cardElement.content streaming
+      summary: { content: '沃嫩蝶正在处理中…' },
+    },
     header: {
       title: { tag: 'plain_text', content: STREAMING_THINKING_HEADER },
       template: 'blue',
     },
     body: {
-      direction: 'vertical',
       elements: [
         {
           tag: 'markdown',
           element_id: 'answer',
-          content: '…',
-        },
-        {
-          tag: 'collapsible_panel',
-          expanded: false,
-          element_id: 'timeline_panel',
-          header: {
-            title: { tag: 'markdown', content: '💭 过程' },
-          },
-          elements: [
-            {
-              tag: 'markdown',
-              element_id: 'timeline',
-              content: '_等待工具调用…_',
-            },
-          ],
+          content: '',
         },
       ],
     },
@@ -317,47 +305,39 @@ function finalCardJSON(params: {
   const { answer, timeline, elapsedMs, state } = params
   const header = state === 'done' ? STREAMING_DONE_HEADER : STREAMING_ERROR_HEADER
   const template = state === 'done' ? 'green' : 'red'
+  const elements: any[] = [
+    {
+      tag: 'markdown',
+      element_id: 'answer',
+      content: answer || '（无输出）',
+    },
+  ]
+  if (timeline) {
+    elements.push({ tag: 'hr' })
+    elements.push({
+      tag: 'markdown',
+      element_id: 'timeline',
+      content: `**💭 过程**\n${timeline}`,
+    })
+  }
+  elements.push({ tag: 'hr' })
+  elements.push({
+    tag: 'note',
+    elements: [
+      { tag: 'plain_text', content: `⏱ ${(elapsedMs / 1000).toFixed(1)}s` },
+    ],
+  })
   return {
     schema: '2.0',
+    config: {
+      streaming_mode: false, // stop streaming on final state
+      summary: { content: state === 'done' ? '已完成' : '失败' },
+    },
     header: {
       title: { tag: 'plain_text', content: header },
       template,
     },
-    body: {
-      direction: 'vertical',
-      elements: [
-        {
-          tag: 'markdown',
-          element_id: 'answer',
-          content: answer || '（无输出）',
-        },
-        {
-          tag: 'collapsible_panel',
-          expanded: false,
-          element_id: 'timeline_panel',
-          header: {
-            title: { tag: 'markdown', content: `💭 过程` },
-          },
-          elements: [
-            {
-              tag: 'markdown',
-              element_id: 'timeline',
-              content: timeline || '_（无工具调用）_',
-            },
-          ],
-        },
-        { tag: 'hr' },
-        {
-          tag: 'note',
-          elements: [
-            {
-              tag: 'plain_text',
-              content: `⏱ ${(elapsedMs / 1000).toFixed(1)}s`,
-            },
-          ],
-        },
-      ],
-    },
+    body: { elements },
   }
 }
 
