@@ -1,0 +1,16 @@
+node_modules/
+.ref-plugins/
+.ref-clone/
+dist/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Editor
+.vscode/
+.idea/
+
+# OS
+Thumbs.db
