@@ -61,8 +61,73 @@ through the `reply` tool, which sends text messages via the Feishu Open API.
 ~/.claude/channels/feishu/
 ├── .env           # FEISHU_APP_ID, FEISHU_APP_SECRET (chmod 600)
 ├── access.json    # allowlist, pending pairings, group policy
+├── server.log     # dlog() debug output (event flow, allowed-checks, emits)
 └── bot.pid        # stale-poller detection
 ```
+
+## Troubleshooting
+
+### `Channels are not currently available` — and there is no org blocking it
+
+If you're on a personal Pro/Max plan and see this at startup, the most likely
+cause is a **telemetry opt-out in your Claude Code settings**. Channels are
+gated by a GrowthBook feature flag (`tengu_harbor`), and GrowthBook can only
+evaluate flags when the telemetry pipe is open. Setting either of the
+following in `~/.claude/settings.json` or project settings disables the
+flag fetch and makes Channels permanently unavailable:
+
+```jsonc
+{
+  "env": {
+    "DISABLE_TELEMETRY": "1",                   // <- breaks Channels
+    "DISABLE_ERROR_REPORTING": "1",             // <- breaks Channels
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"  // <- also breaks Channels
+  }
+}
+```
+
+**Fix:** *delete* the keys (setting to `"0"` is not enough — the key's
+presence alone is what trips the gate). Reported upstream in
+[anthropics/claude-code#45918](https://github.com/anthropics/claude-code/issues/45918)
+and [#38450](https://github.com/anthropics/claude-code/issues/38450).
+
+### `plugin id mismatch (config uses "...", export uses "...")`
+
+Caused by a mismatch between the plugin's declared `id` in `.claude-plugin/plugin.json`
+(or in the marketplace entry) and the `id` string exported from the plugin's
+JS entry. Keep them aligned. This plugin's external id is `feishu-openclaw-plugin`
+historically — that's an unrelated official plugin. For this plugin, both
+sides use `feishu` consistently.
+
+### `TypeError: normalizeAccountId is not a function`
+
+OpenClaw-specific. Does not apply to this plugin.
+
+### `Plugin ... contains dangerous code patterns` during install
+
+Not from this plugin — it's a warning triggered by OpenClaw's static analyzer
+when plugins use `child_process` / env-var + network. Irrelevant here.
+
+## Debugging
+
+Tail the local server log while sending test messages:
+
+```bash
+tail -f ~/.claude/channels/feishu/server.log
+```
+
+You should see:
+
+```
+[2026-04-21T…Z] === server boot ===
+[2026-04-21T…Z] <<< im.message.receive_v1 {"chat_id":"oc_…","chat_type":"p2p","msg_type":"text","sender_open_id":"ou_…"}
+[2026-04-21T…Z] p2p allowed check {"senderId":"ou_…","allowed":true,"dmPolicy":"pairing"}
+[2026-04-21T…Z] >>> emitting notifications/claude/channel {"chatId":"oc_…","text_prefix":"hi"}
+[2026-04-21T…Z] <<< notification emitted ok
+```
+
+If notifications emit but don't reach Claude Code, check the Troubleshooting
+section above — most commonly a telemetry opt-out.
 
 ## License
 
