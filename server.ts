@@ -78,11 +78,25 @@ try {
 writeFileSync(PID_FILE, String(process.pid))
 
 process.on('unhandledRejection', err => {
-  process.stderr.write(`feishu channel: unhandled rejection: ${err}\n`)
+  dlog(`unhandled rejection: ${err}`)
 })
 process.on('uncaughtException', err => {
-  process.stderr.write(`feishu channel: uncaught exception: ${err}\n`)
+  dlog(`uncaught exception: ${err}`)
 })
+
+// --- Debug log sink: write to both stderr AND a tailable file ---
+import { appendFileSync } from 'fs'
+const DEBUG_LOG = join(STATE_DIR, 'server.log')
+function dlog(...parts: any[]): void {
+  const line = `[${new Date().toISOString()}] ${parts.map(p => typeof p === 'string' ? p : JSON.stringify(p)).join(' ')}\n`
+  try {
+    process.stderr.write(line)
+  } catch {}
+  try {
+    appendFileSync(DEBUG_LOG, line)
+  } catch {}
+}
+dlog('=== server boot ===')
 
 // ---------------------------------------------------------------------------
 // Access control state
@@ -418,10 +432,16 @@ setInterval(() => {
 // ---------------------------------------------------------------------------
 const eventDispatcher = new lark.EventDispatcher({}).register({
   'im.message.receive_v1': async (event: any) => {
+    dlog('<<< im.message.receive_v1', {
+      chat_id: event?.message?.chat_id,
+      chat_type: event?.message?.chat_type,
+      msg_type: event?.message?.message_type,
+      sender_open_id: event?.sender?.sender_id?.open_id,
+    })
     try {
       const msg = event?.message
       const sender = event?.sender
-      if (!msg || !sender) return
+      if (!msg || !sender) { dlog('skip: no msg/sender'); return }
 
       const chatId: string = msg.chat_id ?? ''
       const chatType: string = msg.chat_type ?? '' // 'p2p' | 'group'
@@ -456,10 +476,12 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         if (!checkGroupAllowed(chatId)) return
       } else if (chatType === 'p2p') {
         // ---- Pairing path ----
-        // If sender isn't on the allowlist AND policy is 'pairing', mint a code.
-        if (!checkAllowed(senderId)) {
+        const allowed = checkAllowed(senderId)
+        dlog('p2p allowed check', { senderId, allowed, dmPolicy: access.dmPolicy })
+        if (!allowed) {
           if (access.dmPolicy === 'pairing') {
             const code = createPairing(senderId)
+            dlog('created pairing code', { code, senderId })
             await sendText(
               chatId,
               `👋 ${botAppName}: access not configured.\n` +
@@ -496,6 +518,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       // Best-effort; permission_request arrives asynchronously from Claude Code.
 
       // ---- Forward to Claude as channel event ----
+      dlog('>>> emitting notifications/claude/channel', { chatId, text_prefix: text.slice(0, 40) })
       await mcp.notification({
         method: 'notifications/claude/channel',
         params: {
@@ -509,8 +532,9 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
           },
         },
       })
+      dlog('<<< notification emitted ok')
     } catch (err) {
-      process.stderr.write(`feishu channel: inbound handler error: ${String(err)}\n`)
+      dlog('inbound handler error', String(err))
     }
   },
   // Card button callback → permission verdict
