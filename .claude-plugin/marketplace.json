@@ -1,0 +1,17 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "claude-plugin-feishu",
+  "description": "Feishu/Lark channel plugin for Claude Code.",
+  "owner": {
+    "name": "ASauler"
+  },
+  "plugins": [
+    {
+      "name": "feishu",
+      "description": "Feishu/Lark channel — bridge Feishu messages into Claude Code sessions via the Channels protocol (MCP). WebSocket long-connection, bot-identity, permission relay.",
+      "category": "channel",
+      "source": "./",
+      "homepage": "https://github.com/ASauler/claude-plugin-feishu"
+    }
+  ]
+}
