@@ -393,6 +393,26 @@ async function streamToElement(
   }
 }
 
+/** Turn streaming_mode off so a subsequent card.update will apply. */
+async function setCardStreamingMode(
+  cardId: string,
+  enabled: boolean,
+  sequence: number
+): Promise<void> {
+  try {
+    const resp: any = await (client as any).cardkit.v1.card.settings({
+      path: { card_id: cardId },
+      data: {
+        settings: JSON.stringify({ streaming_mode: enabled }),
+        sequence,
+      },
+    })
+    dlog('cardkit card.settings', { sequence, enabled, code: resp?.code, msg: resp?.msg })
+  } catch (err) {
+    dlog('cardkit card.settings FAILED', { sequence, err: String(err) })
+  }
+}
+
 /** Fully replace a card (used for the final "done" state). */
 async function replaceCard(
   cardId: string,
@@ -400,13 +420,14 @@ async function replaceCard(
   sequence: number
 ): Promise<void> {
   try {
-    await (client as any).cardkit.v1.card.update({
+    const resp: any = await (client as any).cardkit.v1.card.update({
       path: { card_id: cardId },
       data: {
         card: { type: 'card_json', data: JSON.stringify(cardJson) },
         sequence,
       },
     })
+    dlog('cardkit card.update', { sequence, code: resp?.code, msg: resp?.msg })
   } catch (err) {
     dlog('cardkit card.update FAILED', { sequence, err: String(err) })
   }
@@ -505,14 +526,16 @@ async function finalizeCard(
     clearTimeout(state.flushTimer)
     state.flushTimer = null
   }
-  const seq = state.sequence++
+  // Disable streaming mode FIRST so the subsequent card.update takes effect
+  // (otherwise the streaming layer keeps the old header/template alive).
+  await setCardStreamingMode(state.cardId, false, state.sequence++)
   const cardJson = finalCardJSON({
     answer: state.answerBuffer,
     timeline: state.timelineBuffer,
     elapsedMs: Date.now() - state.startedAt,
     state: status,
   })
-  await replaceCard(state.cardId, cardJson, seq)
+  await replaceCard(state.cardId, cardJson, state.sequence++)
   activeCards.delete(chatId)
 }
 
