@@ -256,17 +256,119 @@ async function sendText(chatId: string, text: string): Promise<string> {
  * arrives before the previous card finalizes, we finalize the old one
  * first (as "abandoned") and start a fresh one.
  */
+type TimelineEntry = {
+  id: string            // tool_use_id
+  tool: string          // raw tool name, e.g. "Bash", "mcp__lark__..."
+  preview: string       // short args preview
+  startedAt: number
+  finishedAt?: number
+  error?: boolean
+}
+
+type TokenUsage = {
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+}
+
 type CardState = {
   cardId: string
   userMessageId: string       // for typing reaction add/remove
   answerBuffer: string        // cumulative answer text
   timelineBuffer: string      // cumulative timeline markdown
+  timelineEntries: TimelineEntry[]
   sequence: number            // CardKit monotonically increasing seq
   flushTimer: NodeJS.Timeout | null
   finalized: boolean
   startedAt: number
+  answered: boolean           // reply tool has been called
+  pendingFinalizeTimer: NodeJS.Timeout | null
+  tokens: TokenUsage | null
+  sessionId?: string          // Claude Code session_id, filled on first hook
 }
 const activeCards = new Map<string, CardState>() // chatId → state
+const sessionChatMap = new Map<string, string>() // sessionId → chatId cache
+
+/**
+ * Map a raw Claude Code tool name to a display icon + human label.
+ * MCP tools come as `mcp__<server>__<tool>`.
+ */
+function renderToolLabel(tool: string): { icon: string; label: string } {
+  if (tool.startsWith('mcp__feishu__')) return { icon: '💬', label: tool.slice('mcp__feishu__'.length) }
+  if (tool.startsWith('mcp__lark__')) {
+    const rest = tool.slice('mcp__lark__'.length)
+    return { icon: '📡', label: rest.replace(/_/g, '.') }
+  }
+  if (tool.startsWith('mcp__')) {
+    const rest = tool.slice(5).replace(/__/g, ':')
+    return { icon: '🔌', label: rest }
+  }
+  const map: Record<string, string> = {
+    Bash: '🔧',
+    Read: '📖',
+    Write: '✍️',
+    Edit: '✏️',
+    MultiEdit: '✏️',
+    Grep: '🔍',
+    Glob: '📁',
+    WebFetch: '🌐',
+    WebSearch: '🔎',
+    Task: '🤖',
+    TodoWrite: '📋',
+    NotebookEdit: '📓',
+  }
+  return { icon: map[tool] ?? '⚙️', label: tool }
+}
+
+/** Build a short preview of tool_input for inline display. */
+function renderToolPreview(tool: string, input: any): string {
+  if (!input || typeof input !== 'object') return ''
+  const clip = (s: any, n = 60) => {
+    const str = String(s ?? '')
+    return str.length > n ? str.slice(0, n) + '…' : str
+  }
+  if (tool === 'Bash') return `\`${clip(input.command, 80)}\``
+  if (tool === 'Read') {
+    const p = String(input.file_path ?? '')
+    const base = p.split('/').pop() || p
+    const range = input.offset ? ` :${input.offset}${input.limit ? '+' + input.limit : ''}` : ''
+    return `${base}${range}`
+  }
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
+    const p = String(input.file_path ?? '')
+    return p.split('/').pop() || p
+  }
+  if (tool === 'Grep') return `"${clip(input.pattern, 50)}"`
+  if (tool === 'Glob') return `\`${clip(input.pattern, 50)}\``
+  if (tool === 'WebFetch' || tool === 'WebSearch') return clip(input.url ?? input.query, 60)
+  if (tool === 'Task') return clip(input.description ?? input.subagent_type, 60)
+  if (tool === 'TodoWrite') return `${(input.todos ?? []).length} items`
+  if (tool.startsWith('mcp__')) {
+    // Pick the first scalar arg
+    const firstKey = Object.keys(input)[0]
+    if (firstKey) return `${firstKey}=${clip(input[firstKey], 40)}`
+  }
+  return ''
+}
+
+function renderTimeline(entries: TimelineEntry[]): string {
+  if (entries.length === 0) return '_等待工具调用…_'
+  const rows = entries.slice(-20).map(e => {
+    const { icon, label } = renderToolLabel(e.tool)
+    const prev = e.preview ? ` ${e.preview}` : ''
+    let trail: string
+    if (e.finishedAt) {
+      const dur = ((e.finishedAt - e.startedAt) / 1000).toFixed(1)
+      trail = e.error ? ` · ❌ ${dur}s` : ` · ${dur}s`
+    } else {
+      trail = ' · _running…_'
+    }
+    return `${icon} ${label}${prev}${trail}`
+  })
+  const dropped = Math.max(0, entries.length - 20)
+  return (dropped ? `_…${dropped} earlier_\n` : '') + rows.join('\n')
+}
 
 const STREAMING_THINKING_HEADER = '🧐 沃嫩蝶 · 思考中'
 const STREAMING_RUNNING_HEADER = '⚡ 沃嫩蝶 · 执行中'
@@ -288,6 +390,12 @@ function placeholderCardJSON(): any {
       elements: [
         {
           tag: 'markdown',
+          element_id: 'timeline',
+          content: '_等待工具调用…_',
+        },
+        { tag: 'hr' },
+        {
+          tag: 'markdown',
           element_id: 'answer',
           content: '',
         },
@@ -296,13 +404,19 @@ function placeholderCardJSON(): any {
   }
 }
 
+function formatTokens(n: number): string {
+  if (n >= 1000) return (n / 1000).toFixed(n >= 10_000 ? 0 : 1) + 'k'
+  return String(n)
+}
+
 function finalCardJSON(params: {
   answer: string
   timeline: string
   elapsedMs: number
   state: 'done' | 'error'
+  tokens: TokenUsage | null
 }): any {
-  const { answer, timeline, elapsedMs, state } = params
+  const { answer, timeline, elapsedMs, state, tokens } = params
   const header = state === 'done' ? STREAMING_DONE_HEADER : STREAMING_ERROR_HEADER
   const template = state === 'done' ? 'green' : 'red'
   const elements: any[] = [
@@ -312,7 +426,7 @@ function finalCardJSON(params: {
       content: answer || '（无输出）',
     },
   ]
-  if (timeline) {
+  if (timeline && timeline !== '_等待工具调用…_') {
     elements.push({ tag: 'hr' })
     elements.push({
       tag: 'markdown',
@@ -321,9 +435,16 @@ function finalCardJSON(params: {
     })
   }
   elements.push({ tag: 'hr' })
+  const footerParts = [`⏱ ${(elapsedMs / 1000).toFixed(1)}s`]
+  if (tokens) {
+    const t = tokens
+    // Show input/output and total cache in a compact form.
+    const cache = t.cacheRead + t.cacheWrite
+    footerParts.push(`📊 in ${formatTokens(t.input)} · out ${formatTokens(t.output)}` + (cache ? ` · cache ${formatTokens(cache)}` : ''))
+  }
   elements.push({
     tag: 'markdown',
-    content: `<font color='grey'>⏱ ${(elapsedMs / 1000).toFixed(1)}s</font>`,
+    content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
   })
   return {
     schema: '2.0',
@@ -479,10 +600,14 @@ async function ensureCard(
     userMessageId,
     answerBuffer: '',
     timelineBuffer: '',
+    timelineEntries: [],
     sequence: 1,
     flushTimer: null,
     finalized: false,
     startedAt: Date.now(),
+    answered: false,
+    pendingFinalizeTimer: null,
+    tokens: null,
   }
   activeCards.set(chatId, state)
   return state
@@ -505,12 +630,17 @@ function scheduleFlush(chatId: string): void {
 async function flushCard(chatId: string): Promise<void> {
   const state = activeCards.get(chatId)
   if (!state || state.finalized) return
+  // Rebuild timeline from entries (single source of truth).
+  state.timelineBuffer = renderTimeline(state.timelineEntries)
   const seq1 = state.sequence++
   const seq2 = state.sequence++
-  await streamToElement(state.cardId, 'answer', state.answerBuffer || '_思考中…_', seq1)
-  if (state.timelineBuffer) {
-    await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seq2)
-  }
+  await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seq1)
+  await streamToElement(
+    state.cardId,
+    'answer',
+    state.answerBuffer || (state.answered ? '' : '_思考中…_'),
+    seq2
+  )
 }
 
 async function finalizeCard(
@@ -524,16 +654,23 @@ async function finalizeCard(
     clearTimeout(state.flushTimer)
     state.flushTimer = null
   }
+  if (state.pendingFinalizeTimer) {
+    clearTimeout(state.pendingFinalizeTimer)
+    state.pendingFinalizeTimer = null
+  }
   // Disable streaming mode FIRST so the subsequent card.update takes effect
   // (otherwise the streaming layer keeps the old header/template alive).
   await setCardStreamingMode(state.cardId, false, state.sequence++)
   const cardJson = finalCardJSON({
     answer: state.answerBuffer,
-    timeline: state.timelineBuffer,
+    timeline: renderTimeline(state.timelineEntries),
     elapsedMs: Date.now() - state.startedAt,
     state: status,
+    tokens: state.tokens,
   })
   await replaceCard(state.cardId, cardJson, state.sequence++)
+  // Release correlation map entry
+  if (state.sessionId) sessionChatMap.delete(state.sessionId)
   activeCards.delete(chatId)
 }
 
@@ -675,19 +812,25 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     try {
       const state = activeCards.get(chat_id)
       if (state && !state.finalized) {
-        // Stream final answer into the already-created card.
+        // Stream the answer into the card immediately, but delay finalization:
+        // we want the Stop hook to deliver token usage first. Fall back after 3s
+        // in case Stop never arrives.
         dlog('streaming reply into active card', { cardId: state.cardId })
         state.answerBuffer = text
+        state.answered = true
         await flushCard(chat_id)
-        await finalizeCard(chat_id, 'done')
-        dlog('card finalized')
-        // Remove typing reaction (best-effort; reaction_id tracked per chat).
+        // Remove typing reaction now — answer is visible.
         const reactionId = typingReactionsByChat.get(chat_id) ?? null
         if (reactionId && state.userMessageId) {
           await removeTypingReaction(state.userMessageId, reactionId)
           typingReactionsByChat.delete(chat_id)
         }
-        return { content: [{ type: 'text', text: `sent (card finalized)` }] }
+        if (state.pendingFinalizeTimer) clearTimeout(state.pendingFinalizeTimer)
+        state.pendingFinalizeTimer = setTimeout(() => {
+          dlog('reply: fallback finalize (no Stop hook in 3s)')
+          finalizeCard(chat_id, 'done').catch(err => dlog('fallback finalize err', String(err)))
+        }, 3000)
+        return { content: [{ type: 'text', text: `sent (awaiting Stop)` }] }
       }
       // Fallback: no active card, send as plain text.
       const msgId = await sendText(chat_id, text)
@@ -898,6 +1041,159 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 })
 
 // ---------------------------------------------------------------------------
+// Hook relay — local HTTP server on loopback. The plugin's shell hooks
+// (hooks/relay.sh) pipe their stdin JSON here. Discovers chat via transcript.
+// ---------------------------------------------------------------------------
+const HOOK_PORT_FILE = join(STATE_DIR, 'hook.port')
+
+/**
+ * Find the most recent Feishu chat_id referenced in the transcript.
+ * Reads last ~200KB of file and regexes. Caches by session_id.
+ */
+async function correlateSession(sessionId: string, transcriptPath: string): Promise<string | null> {
+  const cached = sessionChatMap.get(sessionId)
+  if (cached) return cached
+  try {
+    const fh = Bun.file(transcriptPath)
+    const size = fh.size
+    if (!size) return null
+    const tailStart = Math.max(0, size - 200 * 1024)
+    const slice = fh.slice(tailStart, size)
+    const text = await slice.text()
+    // Match meta.chat_id from channel notifications in transcript JSONL.
+    const re = /"chat_id":"(oc_[A-Za-z0-9]+)"/g
+    let last: string | null = null
+    for (const m of text.matchAll(re)) last = m[1]
+    if (last) {
+      sessionChatMap.set(sessionId, last)
+      return last
+    }
+  } catch (err) {
+    dlog('correlateSession failed', String(err))
+  }
+  return null
+}
+
+/**
+ * Parse the last assistant message's usage from a transcript JSONL.
+ */
+async function parseTokenUsage(transcriptPath: string): Promise<TokenUsage | null> {
+  try {
+    const fh = Bun.file(transcriptPath)
+    const size = fh.size
+    if (!size) return null
+    const tailStart = Math.max(0, size - 300 * 1024)
+    const slice = fh.slice(tailStart, size)
+    const text = await slice.text()
+    const lines = text.split('\n').filter(Boolean)
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const obj = JSON.parse(lines[i])
+        // Multiple possible shapes: {type:"assistant", message:{usage:...}}
+        // or {message:{usage:...}} or direct {usage:...}.
+        const usage =
+          obj?.message?.usage ??
+          obj?.usage ??
+          null
+        if (usage && (usage.input_tokens !== undefined || usage.output_tokens !== undefined)) {
+          return {
+            input: usage.input_tokens ?? 0,
+            output: usage.output_tokens ?? 0,
+            cacheRead: usage.cache_read_input_tokens ?? 0,
+            cacheWrite: usage.cache_creation_input_tokens ?? 0,
+          }
+        }
+      } catch {}
+    }
+  } catch (err) {
+    dlog('parseTokenUsage failed', String(err))
+  }
+  return null
+}
+
+async function onPreToolUse(payload: any): Promise<void> {
+  const { session_id, transcript_path, tool_name, tool_use_id, tool_input } = payload
+  if (!session_id || !transcript_path) return
+  // Skip our own reply tool — it IS the answer, showing it in timeline is noise.
+  if (tool_name === 'mcp__feishu__reply') return
+  const chatId = await correlateSession(session_id, transcript_path)
+  if (!chatId) return
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  state.sessionId = session_id
+  state.timelineEntries.push({
+    id: tool_use_id ?? `${Date.now()}`,
+    tool: tool_name ?? '?',
+    preview: renderToolPreview(tool_name, tool_input),
+    startedAt: Date.now(),
+  })
+  scheduleFlush(chatId)
+}
+
+async function onPostToolUse(payload: any): Promise<void> {
+  const { session_id, transcript_path, tool_name, tool_use_id, tool_response } = payload
+  if (!session_id || !transcript_path) return
+  if (tool_name === 'mcp__feishu__reply') return
+  const chatId = await correlateSession(session_id, transcript_path)
+  if (!chatId) return
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  const entry = state.timelineEntries.find(e => e.id === tool_use_id)
+  if (entry) {
+    entry.finishedAt = Date.now()
+    entry.error = Boolean(tool_response?.isError ?? tool_response?.is_error)
+  }
+  scheduleFlush(chatId)
+}
+
+async function onStop(payload: any): Promise<void> {
+  const { session_id, transcript_path } = payload
+  if (!session_id || !transcript_path) return
+  const chatId = await correlateSession(session_id, transcript_path)
+  if (!chatId) return
+  const state = activeCards.get(chatId)
+  if (!state || state.finalized) return
+  const tokens = await parseTokenUsage(transcript_path)
+  if (tokens) state.tokens = tokens
+  // Only finalize if reply already arrived. If not, Claude may still be working
+  // on a multi-step response — don't kill the card prematurely.
+  if (state.answered) {
+    await finalizeCard(chatId, 'done')
+  }
+}
+
+function startHookServer(): void {
+  const server = Bun.serve({
+    hostname: '127.0.0.1',
+    port: 0, // ephemeral
+    async fetch(req) {
+      if (req.method !== 'POST') return new Response('POST only', { status: 405 })
+      let body: any
+      try {
+        body = await req.json()
+      } catch {
+        return new Response('bad json', { status: 400 })
+      }
+      const event = body?.hook_event_name
+      dlog('hook event', { event, tool: body?.tool_name })
+      try {
+        if (event === 'PreToolUse') await onPreToolUse(body)
+        else if (event === 'PostToolUse') await onPostToolUse(body)
+        else if (event === 'Stop') await onStop(body)
+      } catch (err) {
+        dlog('hook handler err', String(err))
+      }
+      return new Response('{}', { headers: { 'content-type': 'application/json' } })
+    },
+  })
+  try {
+    writeFileSync(HOOK_PORT_FILE, String(server.port))
+    chmodSync(HOOK_PORT_FILE, 0o600)
+  } catch {}
+  dlog('hook HTTP server listening', { port: server.port })
+}
+
+// ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
 async function main() {
@@ -905,6 +1201,7 @@ async function main() {
   process.stderr.write(
     `feishu channel: bot id=${botOpenId || '(unknown)'} name="${botAppName}"\n`
   )
+  startHookServer()
   await mcp.connect(new StdioServerTransport())
   // wsClient.start never resolves; don't await.
   wsClient.start({ eventDispatcher })
