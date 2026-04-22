@@ -260,6 +260,7 @@ type TimelineEntry = {
   id: string            // tool_use_id
   tool: string          // raw tool name, e.g. "Bash", "mcp__lark__..."
   preview: string       // short args preview
+  outputSummary?: string // short result summary (set on PostToolUse)
   startedAt: number
   finishedAt?: number
   error?: boolean
@@ -361,22 +362,110 @@ function renderToolPreview(tool: string, input: any): string {
   return ''
 }
 
+/** Bucket a tool into a display category (icon + short chinese label). */
+function toolCategory(tool: string): { key: string; icon: string } {
+  if (tool === 'Read' || tool === 'Grep' || tool === 'Glob') return { key: 'explore', icon: '📖' }
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit' || tool === 'NotebookEdit') return { key: 'edit', icon: '✏️' }
+  if (tool === 'Bash') return { key: 'shell', icon: '🔧' }
+  if (tool === 'WebFetch' || tool === 'WebSearch') return { key: 'web', icon: '🌐' }
+  if (tool === 'Task') return { key: 'task', icon: '🤖' }
+  if (tool === 'TodoWrite') return { key: 'todo', icon: '📋' }
+  if (tool.startsWith('mcp__lark__') || tool.startsWith('mcp__feishu__')) return { key: 'lark', icon: '📡' }
+  if (tool.startsWith('mcp__')) return { key: 'mcp', icon: '🔌' }
+  return { key: 'other', icon: '⚙️' }
+}
+
+/** Category display order — keep consistent across rerenders. */
+const CATEGORY_ORDER = ['explore', 'edit', 'shell', 'web', 'lark', 'task', 'todo', 'mcp', 'other']
+
+/** Compute a short, one-line summary of a tool_response for timeline display. */
+function summarizeToolOutput(tool: string, response: any): string {
+  if (!response) return ''
+  const clip = (s: any, n = 36) => {
+    const str = String(s ?? '').replace(/\s+/g, ' ').replace(/[`*_#>\[\]|~]/g, '').trim()
+    return str.length > n ? str.slice(0, n) + '…' : str
+  }
+  // Normalize various shapes: raw string, { content: [...] }, { output, stdout }, etc.
+  const asText = (v: any): string => {
+    if (typeof v === 'string') return v
+    if (Array.isArray(v)) return v.map(x => x?.text ?? x).filter(Boolean).join(' ')
+    if (v?.content) return asText(v.content)
+    if (v?.text) return String(v.text)
+    if (v?.stdout) return String(v.stdout)
+    if (v?.output) return String(v.output)
+    return ''
+  }
+  const text = asText(response)
+  if (tool === 'Read') {
+    // Read output usually includes "     1→..." line numbers. Show byte estimate.
+    return text ? `${Math.round(text.length / 1024)}KB` : ''
+  }
+  if (tool === 'Grep') {
+    // Output often looks like "path:line:match" or pure counts.
+    const lines = text.split('\n').filter(Boolean)
+    return lines.length ? `${lines.length} 命中` : '无命中'
+  }
+  if (tool === 'Glob') {
+    const lines = text.split('\n').filter(Boolean)
+    return `${lines.length} 文件`
+  }
+  if (tool === 'Bash') {
+    // First non-empty line of stdout
+    const first = text.split('\n').find(l => l.trim())
+    return clip(first ?? '✓', 36)
+  }
+  if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') return '✓'
+  if (tool === 'WebFetch' || tool === 'WebSearch') return clip(text, 36)
+  if (tool === 'Task') return clip(text, 36)
+  if (tool === 'TodoWrite') return '✓'
+  if (tool.startsWith('mcp__')) return clip(text, 36)
+  return clip(text, 28)
+}
+
+/**
+ * Render the timeline as:
+ *   [completed clusters one-liner]
+ *   → <latest step detail>
+ * Keeps the card calm when dozens of tools ran.
+ */
 function renderTimeline(entries: TimelineEntry[]): string {
   if (entries.length === 0) return '_等待工具调用…_'
-  const rows = entries.slice(-20).map(e => {
-    const { icon, label } = renderToolLabel(e.tool)
-    const prev = e.preview ? ` ${e.preview}` : ''
-    let trail: string
-    if (e.finishedAt) {
-      const dur = ((e.finishedAt - e.startedAt) / 1000).toFixed(1)
-      trail = e.error ? ` · ❌ ${dur}s` : ` · ${dur}s`
-    } else {
-      trail = ' · _running…_'
-    }
-    return `${icon} ${label}${prev}${trail}`
-  })
-  const dropped = Math.max(0, entries.length - 20)
-  return (dropped ? `_…${dropped} earlier_\n` : '') + rows.join('\n')
+  // Cluster completed entries (not the last in-flight one).
+  const completed = entries.filter(e => e.finishedAt)
+  const running = entries.find(e => !e.finishedAt)
+  const last = entries[entries.length - 1]
+
+  // Tally by category for the summary line.
+  const tally: Record<string, { icon: string; count: number; errors: number }> = {}
+  for (const e of completed) {
+    const c = toolCategory(e.tool)
+    const t = tally[c.key] ?? (tally[c.key] = { icon: c.icon, count: 0, errors: 0 })
+    t.count++
+    if (e.error) t.errors++
+  }
+  const summaryParts = CATEGORY_ORDER
+    .map(k => tally[k])
+    .filter(Boolean)
+    .map(t => (t.errors ? `${t.icon} ${t.count}(❌${t.errors})` : `${t.icon} ${t.count}`))
+
+  // Latest entry detail — show tool + preview + result or running state.
+  const { icon } = toolCategory(last.tool)
+  const prev = last.preview ? ` ${last.preview}` : ''
+  let tail: string
+  if (last.finishedAt) {
+    const dur = ((last.finishedAt - last.startedAt) / 1000).toFixed(1)
+    const out = last.outputSummary ? ` · ${last.outputSummary}` : ''
+    tail = last.error ? ` · ❌ ${dur}s${out}` : ` · ${dur}s${out}`
+  } else {
+    tail = ' · _running…_'
+  }
+  const latestLine = `→ ${icon}${prev}${tail}`
+
+  // Compose. Summary appears only if there's anything besides the latest.
+  const summaryLine = summaryParts.length && (completed.length > 1 || running)
+    ? `_${summaryParts.join(' · ')}_`
+    : ''
+  return [summaryLine, latestLine].filter(Boolean).join('\n')
 }
 
 function placeholderCardJSON(): any {
@@ -422,7 +511,20 @@ function placeholderCardJSON(): any {
         {
           tag: 'markdown',
           element_id: 'footer',
-          content: `<font color='grey'>⏱ 0.0s</font>`,
+          content: `_— ⏱ 0.0s_`,
+        },
+        {
+          tag: 'action',
+          element_id: 'cancel',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '🛑 停止显示' },
+              type: 'text',
+              size: 'small',
+              value: { action: 'cancel_card' },
+            },
+          ],
         },
       ],
     },
@@ -487,7 +589,7 @@ function finalCardJSON(params: {
   elements.push({
     tag: 'markdown',
     element_id: 'footer',
-    content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
+    content: `_— ${footerParts.join(' · ')}_`,
   })
   return {
     schema: '2.0',
@@ -521,14 +623,32 @@ async function createStreamingCard(): Promise<string | null> {
   }
 }
 
-/** Send the card as an IM message — binds cardId to a chat. Returns im message_id. */
-async function sendCardToChat(chatId: string, cardId: string): Promise<string> {
+/** Send the card as an IM message — binds cardId to a chat. Returns im message_id.
+ *  When parentMessageId is provided, uses im.v1.message.reply so the card shows
+ *  as a native reply to the user's triggering message. */
+async function sendCardToChat(
+  chatId: string,
+  cardId: string,
+  parentMessageId?: string
+): Promise<string> {
+  const content = JSON.stringify({ type: 'card', data: { card_id: cardId } })
+  try {
+    if (parentMessageId) {
+      const res: any = await (client.im.message as any).reply({
+        path: { message_id: parentMessageId },
+        data: { content, msg_type: 'interactive' },
+      })
+      return res?.data?.message_id ?? ''
+    }
+  } catch (err) {
+    dlog('im.message.reply failed, falling back to create', String(err))
+  }
   const res: any = await client.im.message.create({
     params: { receive_id_type: 'chat_id' },
     data: {
       receive_id: chatId,
       msg_type: 'interactive',
-      content: JSON.stringify({ type: 'card', data: { card_id: cardId } }),
+      content,
     },
   })
   return res?.data?.message_id ?? ''
@@ -637,7 +757,7 @@ async function ensureCard(
 
   const cardId = await createStreamingCard()
   if (!cardId) return null
-  await sendCardToChat(chatId, cardId)
+  await sendCardToChat(chatId, cardId, userMessageId || undefined)
   const state: CardState = {
     cardId,
     userMessageId,
@@ -683,7 +803,7 @@ async function flushCard(chatId: string): Promise<void> {
       ? `⚡ _执行中 · ${toolCount} 步${runningCount ? ' · ' + runningCount + ' 运行中' : ''}_`
       : '🧐 _思考中…_'
   const elapsed = ((Date.now() - state.startedAt) / 1000).toFixed(1)
-  const footerText = `<font color='grey'>⏱ ${elapsed}s</font>`
+  const footerText = `_— ⏱ ${elapsed}s_`
 
   const seqStatus = state.sequence++
   const seqTimeline = state.sequence++
@@ -739,48 +859,73 @@ async function sendPermissionCard(
   inputPreview: string,
   requestId: string
 ): Promise<void> {
+  // V2 schema, visually consistent with the streaming card. Threaded as a
+  // reply to the streaming card's message when possible so the permission
+  // prompt visually "belongs" to the conversation.
   const card = {
-    config: { wide_screen_mode: true, update_multi: true },
+    schema: '2.0',
+    config: {
+      streaming_mode: false,
+      summary: { content: `🔐 请求执行 ${tool}` },
+    },
     header: {
-      title: { tag: 'plain_text', content: `🔐 Claude 请求执行 ${tool}` },
+      title: { tag: 'plain_text', content: '🔐 沃嫩蝶 · 需要批准' },
       template: 'orange',
     },
-    elements: [
-      {
-        tag: 'div',
-        text: {
-          tag: 'lark_md',
-          content: `**操作**：${description}\n\n**参数预览**：\n\`\`\`\n${inputPreview.slice(0, 800)}\n\`\`\``,
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: `**${tool}** — ${description}`,
         },
-      },
-      {
-        tag: 'note',
-        elements: [
-          {
-            tag: 'plain_text',
-            content: `Request ID: ${requestId} — 或回复 "yes ${requestId}" / "no ${requestId}"`,
+        {
+          tag: 'collapsible_panel',
+          expanded: false,
+          background_style: 'grey',
+          header: {
+            title: { tag: 'markdown', content: '参数预览' },
+            vertical_align: 'center',
+            icon_position: 'right',
           },
-        ],
-      },
-      {
-        tag: 'action',
-        actions: [
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '✅ 批准' },
-            type: 'primary',
-            value: { verdict: 'allow', request_id: requestId },
-          },
-          {
-            tag: 'button',
-            text: { tag: 'plain_text', content: '❌ 拒绝' },
-            type: 'danger',
-            value: { verdict: 'deny', request_id: requestId },
-          },
-        ],
-      },
-    ],
+          elements: [
+            {
+              tag: 'markdown',
+              content: '```\n' + inputPreview.slice(0, 800).replace(/```/g, '`\u200b``') + '\n```',
+            },
+          ],
+        },
+        {
+          tag: 'action',
+          actions: [
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '✅ 批准' },
+              type: 'primary',
+              value: { verdict: 'allow', request_id: requestId },
+            },
+            {
+              tag: 'button',
+              text: { tag: 'plain_text', content: '❌ 拒绝' },
+              type: 'danger',
+              value: { verdict: 'deny', request_id: requestId },
+            },
+          ],
+        },
+        {
+          tag: 'markdown',
+          content: `_或在对话中回复 \`y ${requestId}\` / \`n ${requestId}\`_`,
+        },
+      ],
+    },
   }
+  // Thread the permission card under the current streaming card (if any) so
+  // it visually belongs to the running turn.
+  const activeState = activeCards.get(chatId)
+  const parent = activeState ? undefined : undefined
+  // NB: Feishu currently doesn't let us reply to a card-type message in a way
+  // that groups threading with the user's source message — we skip parenting
+  // and rely on the same chat to cluster messages.
+  void parent
   try {
     await client.im.message.create({
       params: { receive_id_type: 'chat_id' },
@@ -791,10 +936,10 @@ async function sendPermissionCard(
       },
     })
   } catch (err) {
-    // Fallback to plain text if card fails.
+    dlog('permission card send failed', String(err))
     await sendText(
       chatId,
-      `🔐 Claude 想执行 ${tool}: ${description}\n\n回复 "yes ${requestId}" 或 "no ${requestId}"`
+      `🔐 Claude 想执行 ${tool}: ${description}\n回复 y ${requestId} 或 n ${requestId}`
     )
   }
 }
@@ -1037,9 +1182,18 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       // ---- UX: acknowledge with typing reaction + placeholder card ----
       const userMsgId: string = msg.message_id ?? ''
       if (userMsgId) {
-        // Finalize any previous lingering card (abandoned convo).
-        if (activeCards.has(chatId)) {
-          await finalizeCard(chatId, 'done')
+        // Handle concurrent: a previous card still in-flight.
+        const prev = activeCards.get(chatId)
+        if (prev && !prev.finalized) {
+          if (prev.answered) {
+            // Reply already landed; just finalize it normally.
+            await finalizeCard(chatId, 'done')
+          } else {
+            // In-flight but never answered — don't fake a green tick.
+            // Mark it interrupted and drop state so the new card starts clean.
+            prev.answerBuffer = '_🚫 被下一条消息打断_'
+            await finalizeCard(chatId, 'error')
+          }
         }
         // Typing emoji reaction on user's msg (visual ACK).
         const reactionId = await addTypingReaction(userMsgId)
@@ -1068,7 +1222,7 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       dlog('inbound handler error', String(err))
     }
   },
-  // Card button callback → permission verdict
+  // Card button callback → permission verdict OR cancel
   'card.action.trigger': async (event: any) => {
     try {
       const value = event?.action?.value ?? {}
@@ -1087,6 +1241,19 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             content: value.verdict === 'allow' ? '已批准' : '已拒绝',
           },
         }
+      }
+      if (value?.action === 'cancel_card') {
+        // Soft cancel: we can't preempt Claude Code itself, but we can stop
+        // updating this card and tell the user honestly.
+        const chatId = event?.event?.context?.open_chat_id
+          ?? event?.open_chat_id
+          ?? ''
+        const state = chatId ? activeCards.get(chatId) : null
+        if (state && !state.finalized) {
+          state.answerBuffer = '_🛑 已停止显示此次输出。Claude 可能仍在后台运行，但结果不会再更新到这里。_'
+          await finalizeCard(chatId, 'done')
+        }
+        return { toast: { type: 'info', content: '已停止显示' } }
       }
     } catch (err) {
       process.stderr.write(`feishu channel: card action error: ${String(err)}\n`)
@@ -1196,6 +1363,7 @@ async function onPostToolUse(payload: any): Promise<void> {
   if (entry) {
     entry.finishedAt = Date.now()
     entry.error = Boolean(tool_response?.isError ?? tool_response?.is_error)
+    entry.outputSummary = summarizeToolOutput(entry.tool, tool_response)
   }
   scheduleFlush(chatId)
 }
