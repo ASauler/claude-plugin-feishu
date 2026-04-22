@@ -37,8 +37,10 @@ const STATE_DIR =
 const ACCESS_FILE = join(STATE_DIR, 'access.json')
 const ENV_FILE = join(STATE_DIR, '.env')
 const PID_FILE = join(STATE_DIR, 'bot.pid')
+const SCOPES_DIR = join(STATE_DIR, 'scopes')
 
 mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+mkdirSync(SCOPES_DIR, { recursive: true, mode: 0o700 })
 
 // Load ~/.claude/channels/feishu/.env into process.env. Real env wins.
 // Plugin-spawned servers don't get an env block — this is where secrets live.
@@ -103,6 +105,7 @@ dlog('=== server boot ===')
 // ---------------------------------------------------------------------------
 type Policy = 'open' | 'allowlist' | 'pairing'
 type GroupPolicy = 'open' | 'allowlist' | 'disabled'
+type GroupSessionScope = 'group' | 'group_sender' | 'group_topic' | 'group_topic_sender'
 
 interface AccessState {
   /** DM senders who can push messages. open_id values. */
@@ -115,6 +118,14 @@ interface AccessState {
   groupPolicy: GroupPolicy
   /** Require @mention in group chats. */
   requireMention: boolean
+  /**
+   * Default session-scope granularity for groups. A message inside a Feishu
+   * topic thread automatically upgrades to the topic-aware variant
+   * (group → group_topic, group_sender → group_topic_sender).
+   */
+  groupSessionScope: GroupSessionScope
+  /** How many recent turns to replay in each scope's context prefix. */
+  historyPerScope: number
   /** Pending pair codes → sender open_id. TTL 10 min. */
   pending: Record<string, { senderId: string; createdAt: number }>
 }
@@ -126,6 +137,8 @@ function defaultAccess(): AccessState {
     groupAllowlist: [],
     groupPolicy: 'disabled',
     requireMention: true,
+    groupSessionScope: 'group',
+    historyPerScope: 10,
     pending: {},
   }
 }
@@ -181,6 +194,194 @@ function createPairing(senderId: string): string {
   access.pending[code] = { senderId, createdAt: now }
   saveAccess(access)
   return code
+}
+
+// ---------------------------------------------------------------------------
+// Conversation scope — per-(chat/sender/topic) workspace with its own
+// CLAUDE.md (instructions), memory.md (persistent facts), history.jsonl.
+// Completely isolated from user's global ~/.claude/CLAUDE.md.
+// ---------------------------------------------------------------------------
+type ScopeMeta = {
+  chatType: 'p2p' | 'group' | 'private'
+  chatId: string
+  chatName?: string
+  senderId: string
+  senderName?: string
+  topicId?: string
+}
+
+type ResolvedScope = {
+  key: string             // human-readable ID, used in conversation_id
+  dir: string             // absolute path to scope folder
+  effectiveScope: GroupSessionScope | 'dm'
+}
+
+/** Sanitize an ID for safe filesystem use (just paranoia — Feishu IDs are alnum+_). */
+function sanitizeId(s: string): string {
+  return s.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 64)
+}
+
+/**
+ * Resolve the scope directory + key for an inbound message.
+ * Auto-upgrades group→group_topic when a Feishu thread_id is present.
+ */
+function resolveScope(meta: ScopeMeta): ResolvedScope {
+  if (meta.chatType === 'p2p') {
+    const senderFrag = sanitizeId(meta.senderId)
+    const key = `dm/${senderFrag}`
+    return { key, dir: join(SCOPES_DIR, 'dm', senderFrag), effectiveScope: 'dm' }
+  }
+  // Group: apply configured scope, auto-upgrade when topic present.
+  let scope: GroupSessionScope = access.groupSessionScope
+  if (meta.topicId) {
+    if (scope === 'group') scope = 'group_topic'
+    else if (scope === 'group_sender') scope = 'group_topic_sender'
+  }
+  const chatFrag = sanitizeId(meta.chatId)
+  const senderFrag = sanitizeId(meta.senderId)
+  const topicFrag = meta.topicId ? sanitizeId(meta.topicId) : ''
+  let relative: string
+  switch (scope) {
+    case 'group':
+      relative = `group/${chatFrag}`
+      break
+    case 'group_sender':
+      relative = `group/${chatFrag}/sender/${senderFrag}`
+      break
+    case 'group_topic':
+      relative = `group/${chatFrag}/topic/${topicFrag}`
+      break
+    case 'group_topic_sender':
+      relative = `group/${chatFrag}/topic/${topicFrag}/sender/${senderFrag}`
+      break
+  }
+  return { key: relative, dir: join(SCOPES_DIR, relative), effectiveScope: scope }
+}
+
+function scopeClaudeMdDefault(meta: ScopeMeta, scope: ResolvedScope): string {
+  if (scope.effectiveScope === 'dm') {
+    return `# Feishu DM scope
+
+You are **沃嫩蝶**, replying to a single user via Feishu direct message.
+- Markdown (lark_md dialect) is supported — use freely.
+- Always use the \`reply\` tool to respond; never use other messaging tools.
+- Use the \`remember\` tool to persist durable facts about this user across future sessions.
+
+## Style
+- Direct. No preambles. Conclusion first.
+- Primary Chinese, technical terms in English OK.
+- Keep responses compact for mobile.
+
+<!-- You may freely edit this file; it prefixes every message in this scope. -->
+`
+  }
+  const kind = {
+    group: '整个群共用一个会话',
+    group_sender: '群内每位发送人独立会话',
+    group_topic: '每个飞书话题线程独立会话',
+    group_topic_sender: '话题 × 发送人最细粒度独立会话',
+  }[scope.effectiveScope as GroupSessionScope]
+  return `# Feishu group scope · ${scope.effectiveScope}
+
+You are **沃嫩蝶**, responding in a Feishu group chat.
+Scope granularity: **${scope.effectiveScope}** — ${kind}.
+
+- Multiple people may participate; consider sender context when switching topics.
+- Use the \`reply\` tool to respond; use \`remember\` to persist group-wide facts.
+- Keep responses concise — group members won't read walls of text.
+
+<!-- This CLAUDE.md is scoped to this group/topic/sender combo. Edit freely. -->
+`
+}
+
+function ensureScopeDir(scope: ResolvedScope, meta: ScopeMeta): void {
+  mkdirSync(scope.dir, { recursive: true, mode: 0o700 })
+  const claudeFile = join(scope.dir, 'CLAUDE.md')
+  if (!existsSync(claudeFile)) {
+    writeFileSync(claudeFile, scopeClaudeMdDefault(meta, scope))
+  }
+  const memoryFile = join(scope.dir, 'memory.md')
+  if (!existsSync(memoryFile)) {
+    writeFileSync(memoryFile, `# Memory — ${scope.key}\n\n<!-- append-only, timestamped notes learned across sessions -->\n`)
+  }
+  const historyFile = join(scope.dir, 'history.jsonl')
+  if (!existsSync(historyFile)) {
+    writeFileSync(historyFile, '')
+  }
+}
+
+type HistoryTurn = { role: 'user' | 'assistant'; text: string; ts: number; senderName?: string }
+
+function readScopeContext(scope: ResolvedScope, turnLimit: number): {
+  instructions: string
+  memory: string
+  history: HistoryTurn[]
+} {
+  const read = (p: string, cap = 8 * 1024) => {
+    try { return readFileSync(p, 'utf8').slice(-cap) } catch { return '' }
+  }
+  const instructions = read(join(scope.dir, 'CLAUDE.md'), 4 * 1024)
+  const memory = read(join(scope.dir, 'memory.md'), 8 * 1024)
+  const historyRaw = read(join(scope.dir, 'history.jsonl'), 32 * 1024)
+  const turns: HistoryTurn[] = []
+  for (const line of historyRaw.split('\n')) {
+    if (!line.trim()) continue
+    try {
+      const t = JSON.parse(line) as HistoryTurn
+      if (t?.role && typeof t.text === 'string') turns.push(t)
+    } catch {}
+  }
+  return { instructions, memory, history: turns.slice(-turnLimit * 2) }
+}
+
+function appendScopeHistory(scope: ResolvedScope, turn: HistoryTurn): void {
+  try {
+    appendFileSync(join(scope.dir, 'history.jsonl'), JSON.stringify(turn) + '\n')
+  } catch (err) {
+    dlog('appendScopeHistory failed', String(err))
+  }
+}
+
+function appendScopeMemory(scope: ResolvedScope, note: string): void {
+  try {
+    const line = `- [${new Date().toISOString()}] ${note.replace(/\s+/g, ' ').trim()}\n`
+    appendFileSync(join(scope.dir, 'memory.md'), line)
+  } catch (err) {
+    dlog('appendScopeMemory failed', String(err))
+  }
+}
+
+/**
+ * Build the enriched channel-notification content: scope instructions +
+ * memory tail + recent history + the current user message.
+ */
+function buildScopedContent(
+  scope: ResolvedScope,
+  meta: ScopeMeta,
+  currentMessage: string,
+  ctx: { instructions: string; memory: string; history: HistoryTurn[] }
+): string {
+  const parts: string[] = []
+  if (ctx.instructions.trim()) {
+    parts.push('## Scope instructions')
+    parts.push(ctx.instructions.trim())
+  }
+  if (ctx.memory.trim() && ctx.memory.split('\n').filter(l => l.startsWith('- ')).length > 0) {
+    parts.push('## Memory')
+    parts.push(ctx.memory.trim())
+  }
+  if (ctx.history.length > 0) {
+    parts.push('## Recent conversation')
+    for (const t of ctx.history) {
+      const who = t.role === 'user'
+        ? (t.senderName ? t.senderName : '用户')
+        : '沃嫩蝶'
+      parts.push(`**${who}**: ${t.text.trim()}`)
+    }
+  }
+  parts.push('## Current message')
+  parts.push(currentMessage.trim())
+  return parts.join('\n\n')
 }
 
 // ---------------------------------------------------------------------------
@@ -287,6 +488,10 @@ type CardState = {
   pendingFinalizeTimer: NodeJS.Timeout | null
   tokens: TokenUsage | null
   sessionId?: string          // Claude Code session_id, filled on first hook
+  scopeDir?: string           // scope folder to write history back on reply
+  scopeKey?: string           // conversation_id
+  userText?: string           // inbound message text (for history)
+  senderName?: string         // for history formatting
 }
 const activeCards = new Map<string, CardState>() // chatId → state
 const sessionChatMap = new Map<string, string>() // sessionId → chatId cache
@@ -750,7 +955,8 @@ async function removeTypingReaction(
  */
 async function ensureCard(
   chatId: string,
-  userMessageId: string
+  userMessageId: string,
+  scopeInfo?: { dir: string; key: string; userText: string; senderName: string }
 ): Promise<CardState | null> {
   const existing = activeCards.get(chatId)
   if (existing && !existing.finalized) return existing
@@ -771,6 +977,10 @@ async function ensureCard(
     answered: false,
     pendingFinalizeTimer: null,
     tokens: null,
+    scopeDir: scopeInfo?.dir,
+    scopeKey: scopeInfo?.key,
+    userText: scopeInfo?.userText,
+    senderName: scopeInfo?.senderName,
   }
   activeCards.set(chatId, state)
   return state
@@ -959,13 +1169,21 @@ const mcp = new Server(
     },
     instructions:
       'Messages from Feishu arrive as <channel source="feishu" chat_id="..." sender_id="..." ' +
-      'sender_name="..." message_type="dm|group">. Reply with the "reply" tool, passing ' +
-      'the chat_id from the tag. Use markdown formatting freely — it renders in Feishu cards. ' +
-      'For long replies, feel free to split into multiple reply tool calls.',
+      'sender_name="..." message_type="dm|group" conversation_id="..." [thread_id="..."]>. ' +
+      'The message body is a structured prefix: "## Scope instructions" (per-scope ' +
+      'CLAUDE.md), "## Memory" (accumulated facts from prior sessions), "## Recent ' +
+      'conversation" (last N turns), then "## Current message" — the actual new input. ' +
+      'Use conversation_id to understand which scope you are in.\n\n' +
+      'Tools:\n' +
+      '  • reply — ALWAYS use this (not lark_mcp) to respond. chat_id from the tag.\n' +
+      '  • remember — persist a one-line fact into the current scope memory.md. ' +
+      'Use when you learn something durable (user preference, project detail, ' +
+      'decision) that would be useful in future turns of this same scope.',
   }
 )
 
 // reply tool — Claude → Feishu outbound
+// remember tool — Claude → scope memory.md (persist facts across sessions)
 mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
   tools: [
     {
@@ -994,10 +1212,51 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'text'],
       },
     },
+    {
+      name: 'remember',
+      description:
+        'Persist a durable fact into the current scope\'s memory.md. Use this to ' +
+        'remember things that will be useful in FUTURE turns of the same conversation ' +
+        'scope (DM, group, or group-topic) — user preferences, project details, ' +
+        'previously resolved decisions, etc. Do NOT use this for transient state; it ' +
+        'becomes a permanent bullet in a scoped memory file that prefixes every message.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: {
+            type: 'string',
+            description: 'The chat_id from the inbound <channel> tag (required).',
+          },
+          note: {
+            type: 'string',
+            description:
+              'One-line fact to remember. Will be timestamped and appended to the ' +
+              'scope\'s memory.md as a markdown bullet.',
+          },
+        },
+        required: ['chat_id', 'note'],
+      },
+    },
   ],
 }))
 
 mcp.setRequestHandler(CallToolRequestSchema, async req => {
+  if (req.params.name === 'remember') {
+    const { chat_id, note } = req.params.arguments as { chat_id: string; note: string }
+    const state = activeCards.get(chat_id)
+    if (!state?.scopeDir) {
+      return {
+        content: [{ type: 'text', text: 'no active scope for this chat_id' }],
+        isError: true,
+      }
+    }
+    appendScopeMemory(
+      { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm' },
+      note
+    )
+    dlog('remember appended', { scope: state.scopeKey, bytes: note.length })
+    return { content: [{ type: 'text', text: 'remembered' }] }
+  }
   if (req.params.name === 'reply') {
     const { chat_id, text } = req.params.arguments as {
       chat_id: string
@@ -1017,6 +1276,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         dlog('streaming reply into active card', { cardId: state.cardId })
         state.answerBuffer = text
         state.answered = true
+        // Persist this turn (user → assistant) into the scope's history.jsonl.
+        if (state.scopeDir && state.userText) {
+          const now = Date.now()
+          const scopeRef: ResolvedScope = { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm' }
+          appendScopeHistory(scopeRef, { role: 'user', text: state.userText, ts: now, senderName: state.senderName })
+          appendScopeHistory(scopeRef, { role: 'assistant', text, ts: now })
+        }
         await flushCard(chat_id)
         // Remove typing reaction now — answer is visible.
         const reactionId = typingReactionsByChat.get(chat_id) ?? null
@@ -1179,6 +1445,21 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       // Any outstanding permission_request without a mapped chat: assign this one.
       // Best-effort; permission_request arrives asynchronously from Claude Code.
 
+      // ---- Resolve scope + load its workspace (CLAUDE.md / memory.md / history) ----
+      const topicId: string | undefined = msg.thread_id ?? undefined
+      const senderName: string = sender.sender_id?.user_id ?? senderId
+      const scopeMeta: ScopeMeta = {
+        chatType: (chatType === 'p2p' ? 'p2p' : 'group'),
+        chatId,
+        senderId,
+        senderName,
+        topicId,
+      }
+      const scope = resolveScope(scopeMeta)
+      ensureScopeDir(scope, scopeMeta)
+      const ctx = readScopeContext(scope, access.historyPerScope)
+      dlog('scope resolved', { key: scope.key, effective: scope.effectiveScope, historyTurns: ctx.history.length })
+
       // ---- UX: acknowledge with typing reaction + placeholder card ----
       const userMsgId: string = msg.message_id ?? ''
       if (userMsgId) {
@@ -1199,21 +1480,34 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         const reactionId = await addTypingReaction(userMsgId)
         if (reactionId) typingReactionsByChat.set(chatId, reactionId)
         // Create streaming placeholder card — answer element will typewriter in.
-        await ensureCard(chatId, userMsgId)
+        await ensureCard(chatId, userMsgId, {
+          dir: scope.dir,
+          key: scope.key,
+          userText: text,
+          senderName,
+        })
       }
 
-      // ---- Forward to Claude as channel event ----
-      dlog('>>> emitting notifications/claude/channel', { chatId, text_prefix: text.slice(0, 40) })
+      // ---- Forward to Claude as channel event with full scope context ----
+      const enrichedContent = buildScopedContent(scope, scopeMeta, text, ctx)
+      dlog('>>> emitting notifications/claude/channel', {
+        chatId,
+        scope: scope.key,
+        text_prefix: text.slice(0, 40),
+        prefix_bytes: enrichedContent.length,
+      })
       await mcp.notification({
         method: 'notifications/claude/channel',
         params: {
-          content: text,
+          content: enrichedContent,
           meta: {
             chat_id: chatId,
             sender_id: senderId,
-            sender_name: sender.sender_id?.user_id ?? '',
+            sender_name: senderName,
             message_type: chatType === 'p2p' ? 'dm' : 'group',
             chat_type: chatType,
+            thread_id: topicId,
+            conversation_id: scope.key,
           },
         },
       })
