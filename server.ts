@@ -321,33 +321,42 @@ function renderToolLabel(tool: string): { icon: string; label: string } {
   return { icon: map[tool] ?? '⚙️', label: tool }
 }
 
-/** Build a short preview of tool_input for inline display. */
+/** Build a short preview of tool_input for inline display.
+ *  Sanitizes markdown-special chars so long / multiline Bash commands don't
+ *  leak headings, lists, or broken code fences into the card.
+ */
 function renderToolPreview(tool: string, input: any): string {
   if (!input || typeof input !== 'object') return ''
-  const clip = (s: any, n = 60) => {
+  const sanitize = (s: any, n = 55) => {
     const str = String(s ?? '')
+      .replace(/\s+/g, ' ')               // collapse whitespace / newlines
+      .replace(/[`*_#>\[\]|~]/g, '')        // strip md-special chars
+      .trim()
     return str.length > n ? str.slice(0, n) + '…' : str
   }
-  if (tool === 'Bash') return `\`${clip(input.command, 80)}\``
+  if (tool === 'Bash') {
+    // Strip boilerplate "cd /path && " prefix so the actual command shows first.
+    let cmd = String(input.command ?? '').replace(/^cd\s+\S+\s*&&\s*/, '')
+    return sanitize(cmd, 55)
+  }
   if (tool === 'Read') {
     const p = String(input.file_path ?? '')
     const base = p.split('/').pop() || p
-    const range = input.offset ? ` :${input.offset}${input.limit ? '+' + input.limit : ''}` : ''
-    return `${base}${range}`
+    const range = input.offset ? `:${input.offset}${input.limit ? '+' + input.limit : ''}` : ''
+    return sanitize(base + range, 50)
   }
   if (tool === 'Write' || tool === 'Edit' || tool === 'MultiEdit') {
     const p = String(input.file_path ?? '')
-    return p.split('/').pop() || p
+    return sanitize(p.split('/').pop() || p, 50)
   }
-  if (tool === 'Grep') return `"${clip(input.pattern, 50)}"`
-  if (tool === 'Glob') return `\`${clip(input.pattern, 50)}\``
-  if (tool === 'WebFetch' || tool === 'WebSearch') return clip(input.url ?? input.query, 60)
-  if (tool === 'Task') return clip(input.description ?? input.subagent_type, 60)
+  if (tool === 'Grep') return sanitize(input.pattern, 50)
+  if (tool === 'Glob') return sanitize(input.pattern, 50)
+  if (tool === 'WebFetch' || tool === 'WebSearch') return sanitize(input.url ?? input.query, 60)
+  if (tool === 'Task') return sanitize(input.description ?? input.subagent_type, 60)
   if (tool === 'TodoWrite') return `${(input.todos ?? []).length} items`
   if (tool.startsWith('mcp__')) {
-    // Pick the first scalar arg
     const firstKey = Object.keys(input)[0]
-    if (firstKey) return `${firstKey}=${clip(input[firstKey], 40)}`
+    if (firstKey) return sanitize(`${firstKey}=${input[firstKey]}`, 50)
   }
   return ''
 }
@@ -370,11 +379,6 @@ function renderTimeline(entries: TimelineEntry[]): string {
   return (dropped ? `_…${dropped} earlier_\n` : '') + rows.join('\n')
 }
 
-const STREAMING_THINKING_HEADER = '🧐 沃嫩蝶 · 思考中'
-const STREAMING_RUNNING_HEADER = '⚡ 沃嫩蝶 · 执行中'
-const STREAMING_DONE_HEADER = '✨ 沃嫩蝶 · 完成'
-const STREAMING_ERROR_HEADER = '😵 沃嫩蝶 · 失败'
-
 function placeholderCardJSON(): any {
   return {
     schema: '2.0',
@@ -383,21 +387,42 @@ function placeholderCardJSON(): any {
       summary: { content: '沃嫩蝶正在处理中…' },
     },
     header: {
-      title: { tag: 'plain_text', content: STREAMING_THINKING_HEADER },
+      title: { tag: 'plain_text', content: '🤖 沃嫩蝶' },
       template: 'blue',
     },
     body: {
       elements: [
         {
           tag: 'markdown',
-          element_id: 'timeline',
-          content: '_等待工具调用…_',
+          element_id: 'status',
+          content: '🧐 _思考中…_',
         },
-        { tag: 'hr' },
         {
           tag: 'markdown',
           element_id: 'answer',
           content: '',
+        },
+        {
+          tag: 'collapsible_panel',
+          expanded: true,
+          background_style: 'grey',
+          header: {
+            title: { tag: 'markdown', content: '💭 **过程**' },
+            vertical_align: 'center',
+            icon_position: 'right',
+          },
+          elements: [
+            {
+              tag: 'markdown',
+              element_id: 'timeline',
+              content: '_等待工具调用…_',
+            },
+          ],
+        },
+        {
+          tag: 'markdown',
+          element_id: 'footer',
+          content: `<font color='grey'>⏱ 0.0s</font>`,
         },
       ],
     },
@@ -415,35 +440,53 @@ function finalCardJSON(params: {
   elapsedMs: number
   state: 'done' | 'error'
   tokens: TokenUsage | null
+  toolCount: number
 }): any {
-  const { answer, timeline, elapsedMs, state, tokens } = params
-  const header = state === 'done' ? STREAMING_DONE_HEADER : STREAMING_ERROR_HEADER
+  const { answer, timeline, elapsedMs, state, tokens, toolCount } = params
   const template = state === 'done' ? 'green' : 'red'
+  const statusText = state === 'done' ? '✨ _完成_' : '😵 _失败_'
   const elements: any[] = [
+    {
+      tag: 'markdown',
+      element_id: 'status',
+      content: statusText,
+    },
     {
       tag: 'markdown',
       element_id: 'answer',
       content: answer || '（无输出）',
     },
   ]
-  if (timeline && timeline !== '_等待工具调用…_') {
-    elements.push({ tag: 'hr' })
+  if (toolCount > 0 && timeline && timeline !== '_等待工具调用…_') {
     elements.push({
-      tag: 'markdown',
-      element_id: 'timeline',
-      content: `**💭 过程**\n${timeline}`,
+      tag: 'collapsible_panel',
+      expanded: false, // collapsed by default in final state
+      background_style: 'grey',
+      header: {
+        title: { tag: 'markdown', content: `💭 **过程** · ${toolCount} 步` },
+        vertical_align: 'center',
+        icon_position: 'right',
+      },
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: 'timeline',
+          content: timeline,
+        },
+      ],
     })
   }
-  elements.push({ tag: 'hr' })
   const footerParts = [`⏱ ${(elapsedMs / 1000).toFixed(1)}s`]
   if (tokens) {
-    const t = tokens
-    // Show input/output and total cache in a compact form.
-    const cache = t.cacheRead + t.cacheWrite
-    footerParts.push(`📊 in ${formatTokens(t.input)} · out ${formatTokens(t.output)}` + (cache ? ` · cache ${formatTokens(cache)}` : ''))
+    const cache = tokens.cacheRead + tokens.cacheWrite
+    footerParts.push(
+      `📊 in ${formatTokens(tokens.input)} · out ${formatTokens(tokens.output)}` +
+      (cache ? ` · cache ${formatTokens(cache)}` : '')
+    )
   }
   elements.push({
     tag: 'markdown',
+    element_id: 'footer',
     content: `<font color='grey'>${footerParts.join(' · ')}</font>`,
   })
   return {
@@ -453,7 +496,7 @@ function finalCardJSON(params: {
       summary: { content: state === 'done' ? '已完成' : '失败' },
     },
     header: {
-      title: { tag: 'plain_text', content: header },
+      title: { tag: 'plain_text', content: '🤖 沃嫩蝶' },
       template,
     },
     body: { elements },
@@ -632,15 +675,25 @@ async function flushCard(chatId: string): Promise<void> {
   if (!state || state.finalized) return
   // Rebuild timeline from entries (single source of truth).
   state.timelineBuffer = renderTimeline(state.timelineEntries)
-  const seq1 = state.sequence++
-  const seq2 = state.sequence++
-  await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seq1)
-  await streamToElement(
-    state.cardId,
-    'answer',
-    state.answerBuffer || (state.answered ? '' : '_思考中…_'),
-    seq2
-  )
+  const toolCount = state.timelineEntries.length
+  const runningCount = state.timelineEntries.filter(e => !e.finishedAt).length
+  const statusText = state.answered
+    ? '✨ _回复就绪_'
+    : toolCount > 0
+      ? `⚡ _执行中 · ${toolCount} 步${runningCount ? ' · ' + runningCount + ' 运行中' : ''}_`
+      : '🧐 _思考中…_'
+  const elapsed = ((Date.now() - state.startedAt) / 1000).toFixed(1)
+  const footerText = `<font color='grey'>⏱ ${elapsed}s</font>`
+
+  const seqStatus = state.sequence++
+  const seqTimeline = state.sequence++
+  const seqAnswer = state.sequence++
+  const seqFooter = state.sequence++
+
+  await streamToElement(state.cardId, 'status', statusText, seqStatus)
+  await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seqTimeline)
+  await streamToElement(state.cardId, 'answer', state.answerBuffer || '', seqAnswer)
+  await streamToElement(state.cardId, 'footer', footerText, seqFooter)
 }
 
 async function finalizeCard(
@@ -667,6 +720,7 @@ async function finalizeCard(
     elapsedMs: Date.now() - state.startedAt,
     state: status,
     tokens: state.tokens,
+    toolCount: state.timelineEntries.length,
   })
   await replaceCard(state.cardId, cardJson, state.sequence++)
   // Release correlation map entry
