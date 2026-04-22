@@ -214,6 +214,7 @@ type ResolvedScope = {
   key: string             // human-readable ID, used in conversation_id
   dir: string             // absolute path to scope folder
   effectiveScope: GroupSessionScope | 'dm'
+  parentDirs: string[]    // parent scope dirs, closest first (for inheritance seed)
 }
 
 /** Sanitize an ID for safe filesystem use (just paranoia — Feishu IDs are alnum+_). */
@@ -229,7 +230,7 @@ function resolveScope(meta: ScopeMeta): ResolvedScope {
   if (meta.chatType === 'p2p') {
     const senderFrag = sanitizeId(meta.senderId)
     const key = `dm/${senderFrag}`
-    return { key, dir: join(SCOPES_DIR, 'dm', senderFrag), effectiveScope: 'dm' }
+    return { key, dir: join(SCOPES_DIR, 'dm', senderFrag), effectiveScope: 'dm', parentDirs: [] }
   }
   // Group: apply configured scope, auto-upgrade when topic present.
   let scope: GroupSessionScope = access.groupSessionScope
@@ -240,22 +241,33 @@ function resolveScope(meta: ScopeMeta): ResolvedScope {
   const chatFrag = sanitizeId(meta.chatId)
   const senderFrag = sanitizeId(meta.senderId)
   const topicFrag = meta.topicId ? sanitizeId(meta.topicId) : ''
+  const groupRel = `group/${chatFrag}`
+  const topicRel = topicFrag ? `group/${chatFrag}/topic/${topicFrag}` : ''
   let relative: string
+  let parents: string[] = []
   switch (scope) {
     case 'group':
-      relative = `group/${chatFrag}`
+      relative = groupRel
       break
     case 'group_sender':
       relative = `group/${chatFrag}/sender/${senderFrag}`
+      parents = [groupRel]
       break
     case 'group_topic':
-      relative = `group/${chatFrag}/topic/${topicFrag}`
+      relative = topicRel
+      parents = [groupRel]
       break
     case 'group_topic_sender':
       relative = `group/${chatFrag}/topic/${topicFrag}/sender/${senderFrag}`
+      parents = [topicRel, groupRel]
       break
   }
-  return { key: relative, dir: join(SCOPES_DIR, relative), effectiveScope: scope }
+  return {
+    key: relative,
+    dir: join(SCOPES_DIR, relative),
+    effectiveScope: scope,
+    parentDirs: parents.map(p => join(SCOPES_DIR, p)),
+  }
 }
 
 function scopeClaudeMdDefault(meta: ScopeMeta, scope: ResolvedScope): string {
@@ -295,16 +307,55 @@ Scope granularity: **${scope.effectiveScope}** — ${kind}.
 }
 
 function ensureScopeDir(scope: ResolvedScope, meta: ScopeMeta): void {
+  const isFresh = !existsSync(scope.dir)
   mkdirSync(scope.dir, { recursive: true, mode: 0o700 })
   const claudeFile = join(scope.dir, 'CLAUDE.md')
+  const memoryFile = join(scope.dir, 'memory.md')
+  const historyFile = join(scope.dir, 'history.jsonl')
+
+  // CLAUDE.md is always scope-specific; never inherited.
   if (!existsSync(claudeFile)) {
     writeFileSync(claudeFile, scopeClaudeMdDefault(meta, scope))
   }
-  const memoryFile = join(scope.dir, 'memory.md')
+
+  // On first creation, seed history + memory from the closest parent scope
+  // that has content. Parent's values become this child's starting point,
+  // then they diverge. OpenClaw-style inheritance, done statically.
+  let seededFromParent: string | null = null
+  if (isFresh && scope.parentDirs.length > 0) {
+    for (const parentDir of scope.parentDirs) {
+      const parentHist = join(parentDir, 'history.jsonl')
+      const parentMem = join(parentDir, 'memory.md')
+      const histContent = existsSync(parentHist) ? readFileSync(parentHist, 'utf8') : ''
+      const memContent = existsSync(parentMem) ? readFileSync(parentMem, 'utf8') : ''
+      const memBullets = memContent.split('\n').filter(l => l.startsWith('- '))
+      if (!histContent.trim() && memBullets.length === 0) continue
+      // Seed history verbatim.
+      if (histContent.trim() && !existsSync(historyFile)) {
+        writeFileSync(historyFile, histContent)
+      }
+      // Seed memory with a clear "inherited from X" marker.
+      if (memBullets.length > 0 && !existsSync(memoryFile)) {
+        const parentKey = parentDir.startsWith(SCOPES_DIR)
+          ? parentDir.slice(SCOPES_DIR.length + 1)
+          : parentDir
+        writeFileSync(
+          memoryFile,
+          `# Memory — ${scope.key}\n\n<!-- seeded on first use from parent scope: ${parentKey} -->\n${memBullets.join('\n')}\n`
+        )
+      }
+      seededFromParent = parentDir
+      break
+    }
+  }
+  if (seededFromParent) {
+    dlog('scope seeded from parent', { child: scope.key, parent: seededFromParent })
+  }
+
+  // Default skeletons for anything still missing.
   if (!existsSync(memoryFile)) {
     writeFileSync(memoryFile, `# Memory — ${scope.key}\n\n<!-- append-only, timestamped notes learned across sessions -->\n`)
   }
-  const historyFile = join(scope.dir, 'history.jsonl')
   if (!existsSync(historyFile)) {
     writeFileSync(historyFile, '')
   }
@@ -1178,7 +1229,9 @@ const mcp = new Server(
       '  • reply — ALWAYS use this (not lark_mcp) to respond. chat_id from the tag.\n' +
       '  • remember — persist a one-line fact into the current scope memory.md. ' +
       'Use when you learn something durable (user preference, project detail, ' +
-      'decision) that would be useful in future turns of this same scope.',
+      'decision) that would be useful in future turns of this same scope.\n' +
+      '  • forget — clear scope history and/or memory when user explicitly asks ' +
+      '("clear", "reset", "清空记忆", "forget everything"). Targets: history | memory | all.',
   }
 )
 
@@ -1237,6 +1290,30 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'note'],
       },
     },
+    {
+      name: 'forget',
+      description:
+        'Clear persistent state of the current scope. Use when the user explicitly ' +
+        'asks to "forget", "reset", "清空记忆", "start over", "clear history" or similar. ' +
+        'target="history" wipes recent-turn cache only; target="memory" wipes learned ' +
+        'facts; target="all" wipes both (CLAUDE.md is never touched). After calling ' +
+        'forget, you should acknowledge to the user what was cleared.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: {
+            type: 'string',
+            description: 'The chat_id from the inbound <channel> tag (required).',
+          },
+          target: {
+            type: 'string',
+            enum: ['history', 'memory', 'all'],
+            description: 'Which slice of scope state to clear.',
+          },
+        },
+        required: ['chat_id', 'target'],
+      },
+    },
   ],
 }))
 
@@ -1251,11 +1328,42 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
     }
     appendScopeMemory(
-      { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm' },
+      { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm', parentDirs: [] },
       note
     )
     dlog('remember appended', { scope: state.scopeKey, bytes: note.length })
     return { content: [{ type: 'text', text: 'remembered' }] }
+  }
+  if (req.params.name === 'forget') {
+    const { chat_id, target } = req.params.arguments as { chat_id: string; target: 'history' | 'memory' | 'all' }
+    const state = activeCards.get(chat_id)
+    if (!state?.scopeDir) {
+      return {
+        content: [{ type: 'text', text: 'no active scope for this chat_id' }],
+        isError: true,
+      }
+    }
+    const cleared: string[] = []
+    try {
+      if (target === 'history' || target === 'all') {
+        writeFileSync(join(state.scopeDir, 'history.jsonl'), '')
+        cleared.push('history')
+      }
+      if (target === 'memory' || target === 'all') {
+        writeFileSync(
+          join(state.scopeDir, 'memory.md'),
+          `# Memory — ${state.scopeKey}\n\n<!-- cleared ${new Date().toISOString()} -->\n`
+        )
+        cleared.push('memory')
+      }
+      dlog('forget', { scope: state.scopeKey, target, cleared })
+      return { content: [{ type: 'text', text: `cleared: ${cleared.join(' + ')}` }] }
+    } catch (err) {
+      return {
+        content: [{ type: 'text', text: `forget failed: ${String(err)}` }],
+        isError: true,
+      }
+    }
   }
   if (req.params.name === 'reply') {
     const { chat_id, text } = req.params.arguments as {
@@ -1279,7 +1387,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         // Persist this turn (user → assistant) into the scope's history.jsonl.
         if (state.scopeDir && state.userText) {
           const now = Date.now()
-          const scopeRef: ResolvedScope = { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm' }
+          const scopeRef: ResolvedScope = { key: state.scopeKey ?? '', dir: state.scopeDir, effectiveScope: 'dm', parentDirs: [] }
           appendScopeHistory(scopeRef, { role: 'user', text: state.userText, ts: now, senderName: state.senderName })
           appendScopeHistory(scopeRef, { role: 'assistant', text, ts: now })
         }
