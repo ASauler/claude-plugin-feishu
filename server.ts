@@ -322,10 +322,8 @@ function finalCardJSON(params: {
   }
   elements.push({ tag: 'hr' })
   elements.push({
-    tag: 'note',
-    elements: [
-      { tag: 'plain_text', content: `⏱ ${(elapsedMs / 1000).toFixed(1)}s` },
-    ],
+    tag: 'markdown',
+    content: `<font color='grey'>⏱ ${(elapsedMs / 1000).toFixed(1)}s</font>`,
   })
   return {
     schema: '2.0',
