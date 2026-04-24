@@ -1306,7 +1306,7 @@ async function sendPermissionCard(
   // and rely on the same chat to cluster messages.
   void parent
   try {
-    await client.im.message.create({
+    const res: any = await client.im.message.create({
       params: { receive_id_type: 'chat_id' },
       data: {
         receive_id: chatId,
@@ -1314,6 +1314,10 @@ async function sendPermissionCard(
         content: JSON.stringify(card),
       },
     })
+    const messageId = res?.data?.message_id ?? ''
+    if (messageId) {
+      pendingPermissionMessages.set(requestId, { messageId, chatId })
+    }
   } catch (err) {
     dlog('permission card send failed', String(err))
     await sendText(
@@ -1588,6 +1592,8 @@ const PermissionRequestSchema = z.object({
 
 /** Track which chat a pending request belongs to, so we know where to post the card. */
 const pendingPermissionChat = new Map<string, string>()
+/** requestId → {messageId, chatId} so we can delete the permission card on resolution. */
+const pendingPermissionMessages = new Map<string, { messageId: string; chatId: string }>()
 /** Most recent approved sender's "home" chat — used as default destination. */
 let defaultHomeChat = ''
 
@@ -1718,6 +1724,14 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         })
         await sendText(chatId, `verdict recorded: ${behavior} (${requestId})`)
         pendingPermissionChat.delete(requestId)
+        // Also clean up the permission card message if there was one.
+        const pc = pendingPermissionMessages.get(requestId)
+        if (pc?.messageId) {
+          try {
+            await (client.im.message as any).delete({ path: { message_id: pc.messageId } })
+          } catch {}
+          pendingPermissionMessages.delete(requestId)
+        }
         return
       }
 
@@ -1826,18 +1840,31 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         action_keys: event?.action ? Object.keys(event.action) : [],
       })
       if (value?.verdict && value?.request_id) {
+        const requestId = String(value.request_id)
+        const verdict = value.verdict === 'allow' ? 'allow' : 'deny'
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
-          params: {
-            request_id: String(value.request_id),
-            behavior: value.verdict === 'allow' ? 'allow' : 'deny',
-          },
+          params: { request_id: requestId, behavior: verdict },
         })
-        pendingPermissionChat.delete(String(value.request_id))
+        pendingPermissionChat.delete(requestId)
+        // Delete the permission card message so chat stays clean — like a
+        // tool-timeline entry getting compressed after its work is done.
+        const pc = pendingPermissionMessages.get(requestId)
+        if (pc?.messageId) {
+          try {
+            await (client.im.message as any).delete({
+              path: { message_id: pc.messageId },
+            })
+            dlog('permission card deleted', { requestId, messageId: pc.messageId })
+          } catch (err) {
+            dlog('permission card delete failed', { requestId, err: String(err) })
+          }
+          pendingPermissionMessages.delete(requestId)
+        }
         return {
           toast: {
             type: 'success',
-            content: value.verdict === 'allow' ? '已批准' : '已拒绝',
+            content: verdict === 'allow' ? '已批准' : '已拒绝',
           },
         }
       }
