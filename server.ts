@@ -848,17 +848,17 @@ function placeholderCardJSON(): any {
           element_id: 'footer',
           content: `— ⏱ 0.0s`,
         },
-        // V2 schema: button is a direct element, NOT inside an `action`
-        // container (which V2 dropped). Use `behaviors: [{type:'callback'}]`
-        // for interaction.
-        {
-          tag: 'button',
-          text: { tag: 'plain_text', content: '🛑 停止显示' },
-          type: 'text',
-          behaviors: [
-            { type: 'callback', value: { action: 'cancel_card' } },
-          ],
-        },
+        // 停止显示 button disabled — semantics unclear (soft cancel vs real
+        // interrupt) until SIGINT behavior is verified. Re-enable once the
+        // interrupt design is finalized.
+        // {
+        //   tag: 'button',
+        //   text: { tag: 'plain_text', content: '🛑 停止显示' },
+        //   type: 'text',
+        //   behaviors: [
+        //     { type: 'callback', value: { action: 'cancel_card' } },
+        //   ],
+        // },
       ],
     },
   }
