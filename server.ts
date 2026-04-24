@@ -2011,7 +2011,7 @@ async function onPreToolUse(payload: any): Promise<void> {
   const { session_id, transcript_path, tool_name, tool_use_id, tool_input } = payload
   if (!session_id || !transcript_path) return
   // Skip our own reply tool — it IS the answer, showing it in timeline is noise.
-  if (tool_name === 'mcp__feishu__reply') return
+  if (tool_name === 'mcp__feishu__reply' || tool_name === 'mcp__plugin_feishu_feishu__reply') return
   const chatId = await correlateSession(session_id, transcript_path)
   if (!chatId) return
   const state = activeCards.get(chatId)
@@ -2029,9 +2029,26 @@ async function onPreToolUse(payload: any): Promise<void> {
 async function onPostToolUse(payload: any): Promise<void> {
   const { session_id, transcript_path, tool_name, tool_use_id, tool_response } = payload
   if (!session_id || !transcript_path) return
-  if (tool_name === 'mcp__feishu__reply') return
+  // Our reply tool shows up as mcp__plugin_feishu_feishu__reply in the new
+  // plugin packaging, or mcp__feishu__reply in legacy form. Treat both as ours.
+  const isOurReply =
+    tool_name === 'mcp__feishu__reply' ||
+    tool_name === 'mcp__plugin_feishu_feishu__reply'
   const chatId = await correlateSession(session_id, transcript_path)
   if (!chatId) return
+  if (isOurReply) {
+    // Parse final token usage eagerly — it's already in the transcript by now,
+    // even though Stop hook hasn't fired yet. This beats the 6s fallback race.
+    const state = activeCards.get(chatId)
+    if (state && !state.finalized) {
+      const tokens = await parseTokenUsage(transcript_path)
+      if (tokens) {
+        state.tokens = tokens
+        dlog('tokens parsed early (from reply PostToolUse)', tokens)
+      }
+    }
+    return
+  }
   const state = activeCards.get(chatId)
   if (!state || state.finalized) return
   const entry = state.timelineEntries.find(e => e.id === tool_use_id)
