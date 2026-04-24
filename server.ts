@@ -814,7 +814,7 @@ function placeholderCardJSON(): any {
       summary: { content: '沃嫩蝶正在处理中…' },
     },
     header: {
-      title: { tag: 'plain_text', content: '🤖 沃嫩蝶' },
+      title: { tag: 'plain_text', content: '🧐 思考中' },
       template: 'blue',
     },
     body: {
@@ -881,7 +881,7 @@ function finalCardJSON(params: {
 }): any {
   const { answer, timeline, elapsedMs, state, tokens, toolCount, actions, chatId } = params
   const template = state === 'done' ? 'green' : 'red'
-  const headerTitle = state === 'done' ? '✨ 沃嫩蝶 · 完成' : '😵 沃嫩蝶 · 失败'
+  const headerTitle = state === 'done' ? '✨ 完成' : '😵 失败'
   // In final state the status moves UP into the header; no body status element.
   const elements: any[] = [
     {
