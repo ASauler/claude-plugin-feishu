@@ -272,9 +272,10 @@ function resolveScope(meta: ScopeMeta): ResolvedScope {
 
 function scopeClaudeMdDefault(meta: ScopeMeta, scope: ResolvedScope): string {
   if (scope.effectiveScope === 'dm') {
-    return `# Feishu DM scope
+    const who = meta.senderName ? ` (${meta.senderName})` : ''
+    return `# Feishu DM scope${who}
 
-You are **沃嫩蝶**, replying to a single user via Feishu direct message.
+You are **沃嫩蝶**, replying to **${meta.senderName || 'a user'}** via Feishu direct message.
 - Markdown (lark_md dialect) is supported — use freely.
 - Always use the \`reply\` tool to respond; never use other messaging tools.
 - Use the \`remember\` tool to persist durable facts about this user across future sessions.
@@ -293,12 +294,13 @@ You are **沃嫩蝶**, replying to a single user via Feishu direct message.
     group_topic: '每个飞书话题线程独立会话',
     group_topic_sender: '话题 × 发送人最细粒度独立会话',
   }[scope.effectiveScope as GroupSessionScope]
-  return `# Feishu group scope · ${scope.effectiveScope}
+  const groupLabel = meta.chatName ? `「${meta.chatName}」` : ''
+  return `# Feishu group scope · ${scope.effectiveScope}${groupLabel ? ` · ${groupLabel}` : ''}
 
-You are **沃嫩蝶**, responding in a Feishu group chat.
+You are **沃嫩蝶**, responding in Feishu group ${groupLabel || '(unnamed)'}.
 Scope granularity: **${scope.effectiveScope}** — ${kind}.
 
-- Multiple people may participate; consider sender context when switching topics.
+- Multiple people may participate; when sender context switches, address them by name from the channel tag.
 - Use the \`reply\` tool to respond; use \`remember\` to persist group-wide facts.
 - Keep responses concise — group members won't read walls of text.
 
@@ -413,6 +415,16 @@ function buildScopedContent(
   ctx: { instructions: string; memory: string; history: HistoryTurn[] }
 ): string {
   const parts: string[] = []
+  // Short header so Claude always has the human-readable who/where.
+  const contextLines = [
+    `· 会话类型: ${meta.chatType === 'p2p' ? '私聊' : '群聊'}`,
+    meta.chatName ? `· 群名: ${meta.chatName}` : '',
+    meta.senderName ? `· 发送人: ${meta.senderName}` : '',
+    meta.topicId ? `· 话题线程: ${meta.topicId}` : '',
+    `· scope: ${scope.key}`,
+  ].filter(Boolean)
+  parts.push('## Context')
+  parts.push(contextLines.join('\n'))
   if (ctx.instructions.trim()) {
     parts.push('## Scope instructions')
     parts.push(ctx.instructions.trim())
@@ -481,6 +493,51 @@ async function probeBotIdentity(): Promise<void> {
     process.stderr.write(
       `feishu channel: bot identity probe (v3/info) failed: ${String(err)}\n`
     )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Name resolution — turn raw open_id / chat_id into human-readable names.
+// Results cached in-process; TTL effectively "until restart" (fine for a bot
+// that restarts on every plugin reload).
+// ---------------------------------------------------------------------------
+const senderNameCache = new Map<string, string>() // open_id → display name
+const chatNameCache = new Map<string, string>()   // chat_id → chat name
+
+async function resolveSenderName(openId: string): Promise<string> {
+  if (!openId) return ''
+  const cached = senderNameCache.get(openId)
+  if (cached) return cached
+  try {
+    const res: any = await (client as any).contact.v3.user.get({
+      path: { user_id: openId },
+      params: { user_id_type: 'open_id' },
+    })
+    const name = res?.data?.user?.name ?? openId
+    senderNameCache.set(openId, name)
+    return name
+  } catch (err) {
+    dlog('resolveSenderName failed', { openId, err: String(err) })
+    senderNameCache.set(openId, openId) // cache the failure so we don't retry
+    return openId
+  }
+}
+
+async function resolveChatName(chatId: string): Promise<string> {
+  if (!chatId) return ''
+  const cached = chatNameCache.get(chatId)
+  if (cached) return cached
+  try {
+    const res: any = await (client as any).im.v1.chat.get({
+      path: { chat_id: chatId },
+    })
+    const name = res?.data?.name ?? chatId
+    chatNameCache.set(chatId, name)
+    return name
+  } catch (err) {
+    dlog('resolveChatName failed', { chatId, err: String(err) })
+    chatNameCache.set(chatId, chatId)
+    return chatId
   }
 }
 
@@ -1558,10 +1615,16 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
       // ---- Resolve scope + load its workspace (CLAUDE.md / memory.md / history) ----
       const topicId: string | undefined = msg.thread_id ?? undefined
-      const senderName: string = sender.sender_id?.user_id ?? senderId
+      // Resolve display names in parallel (chat name only for groups).
+      const [senderName, chatName] = await Promise.all([
+        resolveSenderName(senderId),
+        chatType === 'group' ? resolveChatName(chatId) : Promise.resolve(''),
+      ])
+      dlog('names resolved', { senderName, chatName })
       const scopeMeta: ScopeMeta = {
         chatType: (chatType === 'p2p' ? 'p2p' : 'group'),
         chatId,
+        chatName,
         senderId,
         senderName,
         topicId,
@@ -1607,20 +1670,19 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         text_prefix: text.slice(0, 40),
         prefix_bytes: enrichedContent.length,
       })
+      const metaOut: Record<string, string> = {
+        chat_id: chatId,
+        sender_id: senderId,
+        sender_name: senderName,
+        message_type: chatType === 'p2p' ? 'dm' : 'group',
+        chat_type: chatType,
+        conversation_id: scope.key,
+      }
+      if (chatName) metaOut.chat_name = chatName
+      if (topicId) metaOut.thread_id = topicId
       await mcp.notification({
         method: 'notifications/claude/channel',
-        params: {
-          content: enrichedContent,
-          meta: {
-            chat_id: chatId,
-            sender_id: senderId,
-            sender_name: senderName,
-            message_type: chatType === 'p2p' ? 'dm' : 'group',
-            chat_type: chatType,
-            thread_id: topicId,
-            conversation_id: scope.key,
-          },
-        },
+        params: { content: enrichedContent, meta: metaOut },
       })
       dlog('<<< notification emitted ok')
     } catch (err) {
