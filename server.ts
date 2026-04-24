@@ -845,13 +845,9 @@ function finalCardJSON(params: {
 }): any {
   const { answer, timeline, elapsedMs, state, tokens, toolCount } = params
   const template = state === 'done' ? 'green' : 'red'
-  const statusText = state === 'done' ? '✨ _完成_' : '😵 _失败_'
+  const headerTitle = state === 'done' ? '✨ 沃嫩蝶 · 完成' : '😵 沃嫩蝶 · 失败'
+  // In final state the status moves UP into the header; no body status element.
   const elements: any[] = [
-    {
-      tag: 'markdown',
-      element_id: 'status',
-      content: statusText,
-    },
     {
       tag: 'markdown',
       element_id: 'answer',
@@ -894,7 +890,7 @@ function finalCardJSON(params: {
       summary: { content: state === 'done' ? '已完成' : '失败' },
     },
     header: {
-      title: { tag: 'plain_text', content: '🤖 沃嫩蝶' },
+      title: { tag: 'plain_text', content: headerTitle },
       template,
     },
     body: { elements },
