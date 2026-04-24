@@ -1221,6 +1221,9 @@ async function finalizeCard(
       toolCount: state.timelineEntries.length,
       chatId,
     })
+    dlog('finalized card snapshot saved', { chatId, cardId: state.cardId, actions: state.userActions.length })
+  } else {
+    dlog('finalize: no userActions, no snapshot', { chatId, hasActions: !!state.userActions })
   }
   // Release correlation map entry
   if (state.sessionId) sessionChatMap.delete(state.sessionId)
@@ -1840,6 +1843,11 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         // Rebuild the card without buttons + append "已选择" footer line,
         // so the user gets visual confirmation and can't double-click.
         const snap = lastFinalizedCard.get(clickedChatId)
+        dlog('snap lookup', {
+          chatId: clickedChatId,
+          hasSnap: !!snap,
+          snapKeys: [...lastFinalizedCard.keys()],
+        })
         if (snap) {
           try {
             const updatedJson = finalCardJSON({
