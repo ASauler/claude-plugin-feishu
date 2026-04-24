@@ -1697,7 +1697,19 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
   // Card button callback → permission verdict OR cancel
   'card.action.trigger': async (event: any) => {
     try {
-      const value = event?.action?.value ?? {}
+      // V2 callbacks put value under different paths depending on schema /
+      // SDK version. Try them all.
+      const value =
+        event?.action?.value ??
+        event?.action?.form_value ??
+        event?.action?.behaviors?.[0]?.value ??
+        event?.event?.action?.value ??
+        {}
+      dlog('card.action.trigger', {
+        value,
+        raw_event_keys: event ? Object.keys(event) : [],
+        action_keys: event?.action ? Object.keys(event.action) : [],
+      })
       if (value?.verdict && value?.request_id) {
         await mcp.notification({
           method: 'notifications/claude/channel/permission',
