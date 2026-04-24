@@ -1747,6 +1747,13 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
       const ctx = readScopeContext(scope, access.historyPerScope)
       dlog('scope resolved', { key: scope.key, effective: scope.effectiveScope, historyTurns: ctx.history.length })
 
+      // Invalidate stale session→chat cache entries. One Claude Code session
+      // can serve multiple chats in sequence; without this, hooks fired for
+      // *this* inbound would resolve to the PREVIOUS chat_id via stale cache.
+      for (const [sid, cid] of sessionChatMap.entries()) {
+        if (cid !== chatId) sessionChatMap.delete(sid)
+      }
+
       // ---- UX: acknowledge with typing reaction + placeholder card ----
       const userMsgId: string = msg.message_id ?? ''
       if (userMsgId) {
