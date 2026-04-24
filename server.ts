@@ -766,16 +766,8 @@ function placeholderCardJSON(): any {
           element_id: 'footer',
           content: `_— ⏱ 0.0s_`,
         },
-        {
-          tag: 'action',
-          actions: [
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: '🛑 停止显示' },
-              value: { action: 'cancel_card' },
-            },
-          ],
-        },
+        // NOTE: V2 schema does not support the `action` element at all
+        // (ErrPath: elements -> action unsupported). Cancel button dropped.
       ],
     },
   }
@@ -1489,15 +1481,38 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
 
       // In groups, strip @bot mention.
       if (chatType === 'group') {
-        // mentions array is on the message object in Feishu SDK
         const mentions: any[] = msg.mentions ?? []
-        const mentionsBot = mentions.some(
-          m => m?.id?.open_id === botOpenId || m?.key === `@_user_${botAppName}`
-        )
-        if (access.requireMention && !mentionsBot) return
-        // Remove @bot text
+        // Broader mention match: handle multiple Feishu payload shapes.
+        const mentionsBot = mentions.some(m => {
+          const ids = [m?.id?.open_id, m?.id, m?.open_id].filter(Boolean)
+          if (botOpenId && ids.includes(botOpenId)) return true
+          const keyStr = String(m?.key ?? '')
+          if (botAppName && keyStr.includes(botAppName)) return true
+          const nameStr = String(m?.name ?? '')
+          if (botAppName && nameStr.includes(botAppName)) return true
+          return false
+        })
+        dlog('group mention check', {
+          chatId,
+          senderId,
+          botOpenId,
+          botAppName,
+          mentionsCount: mentions.length,
+          mentionsSample: mentions.slice(0, 3),
+          mentionsBot,
+          requireMention: access.requireMention,
+        })
+        if (access.requireMention && !mentionsBot) {
+          dlog('group drop: requireMention but no bot mention')
+          return
+        }
         text = text.replace(/@_user_\d+\s*/g, '').replace(/@\S+\s*/g, '').trim()
-        if (!checkGroupAllowed(chatId)) return
+        const groupAllowed = checkGroupAllowed(chatId)
+        dlog('group allowed check', { chatId, groupAllowed, groupPolicy: access.groupPolicy })
+        if (!groupAllowed) {
+          dlog('group drop: chat not in allowlist / policy disabled')
+          return
+        }
       } else if (chatType === 'p2p') {
         // ---- Pairing path ----
         const allowed = checkAllowed(senderId)
