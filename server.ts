@@ -764,7 +764,7 @@ function placeholderCardJSON(): any {
         {
           tag: 'markdown',
           element_id: 'footer',
-          content: `_— ⏱ 0.0s_`,
+          content: `— ⏱ 0.0s`,
         },
         // NOTE: V2 schema does not support the `action` element at all
         // (ErrPath: elements -> action unsupported). Cancel button dropped.
@@ -828,7 +828,7 @@ function finalCardJSON(params: {
   elements.push({
     tag: 'markdown',
     element_id: 'footer',
-    content: `_— ${footerParts.join(' · ')}_`,
+    content: `— ${footerParts.join(' · ')}`,
   })
   return {
     schema: '2.0',
@@ -1047,7 +1047,7 @@ async function flushCard(chatId: string): Promise<void> {
       ? `⚡ _执行中 · ${toolCount} 步${runningCount ? ' · ' + runningCount + ' 运行中' : ''}_`
       : '🧐 _思考中…_'
   const elapsed = ((Date.now() - state.startedAt) / 1000).toFixed(1)
-  const footerText = `_— ⏱ ${elapsed}s_`
+  const footerText = `— ⏱ ${elapsed}s`
 
   const seqStatus = state.sequence++
   const seqTimeline = state.sequence++
@@ -1380,9 +1380,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         }
         if (state.pendingFinalizeTimer) clearTimeout(state.pendingFinalizeTimer)
         state.pendingFinalizeTimer = setTimeout(() => {
-          dlog('reply: fallback finalize (no Stop hook in 3s)')
+          dlog('reply: fallback finalize (no Stop hook in 6s)')
           finalizeCard(chat_id, 'done').catch(err => dlog('fallback finalize err', String(err)))
-        }, 3000)
+        }, 6000)
         return { content: [{ type: 'text', text: `sent (awaiting Stop)` }] }
       }
       // Fallback: no active card, send as plain text.
