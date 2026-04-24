@@ -612,6 +612,24 @@ const activeCards = new Map<string, CardState>() // chatId → state
 const sessionChatMap = new Map<string, string>() // sessionId → chatId cache
 
 /**
+ * Snapshot of a finalized card that still has live buttons.
+ * Kept so we can rebuild the card (minus buttons, plus a "已选择" line) when
+ * the user taps one.
+ */
+type FinalizedCardSnapshot = {
+  cardId: string
+  sequence: number
+  answer: string
+  timeline: string
+  elapsedMs: number
+  state: 'done' | 'error'
+  tokens: TokenUsage | null
+  toolCount: number
+  chatId: string
+}
+const lastFinalizedCard = new Map<string, FinalizedCardSnapshot>() // chatId → snapshot
+
+/**
  * Map a raw Claude Code tool name to a display icon + human label.
  * MCP tools come as `mcp__<server>__<tool>`.
  */
@@ -891,6 +909,7 @@ function finalCardJSON(params: {
             value: {
               user_action: a.value,
               chat_id: chatId ?? '',
+              label: a.label,
             },
           },
         ],
@@ -1188,6 +1207,21 @@ async function finalizeCard(
     chatId,
   })
   await replaceCard(state.cardId, cardJson, state.sequence++)
+  // If this card carried user-actionable buttons, snapshot the state so we
+  // can rebuild the card (minus buttons, plus a "已选择" line) on tap.
+  if (state.userActions && state.userActions.length > 0) {
+    lastFinalizedCard.set(chatId, {
+      cardId: state.cardId,
+      sequence: state.sequence,
+      answer: state.answerBuffer,
+      timeline: renderTimeline(state.timelineEntries),
+      elapsedMs: Date.now() - state.startedAt,
+      state: status,
+      tokens: state.tokens,
+      toolCount: state.timelineEntries.length,
+      chatId,
+    })
+  }
   // Release correlation map entry
   if (state.sessionId) sessionChatMap.delete(state.sessionId)
   activeCards.delete(chatId)
@@ -1798,23 +1832,48 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         }
       }
       if (value?.user_action && value?.chat_id) {
-        // Claude-provided button click. Emit as a channel notification so Claude
-        // gets another turn to act on the user's choice.
         const clickedChatId = String(value.chat_id)
         const userActionValue = String(value.user_action)
-        dlog('user action clicked', { chatId: clickedChatId, value: userActionValue })
+        const clickedLabel = String(value.label ?? userActionValue)
+        dlog('user action clicked', { chatId: clickedChatId, value: userActionValue, label: clickedLabel })
+
+        // Rebuild the card without buttons + append "已选择" footer line,
+        // so the user gets visual confirmation and can't double-click.
+        const snap = lastFinalizedCard.get(clickedChatId)
+        if (snap) {
+          try {
+            const updatedJson = finalCardJSON({
+              answer: snap.answer + `\n\n✅ _已选择：${clickedLabel}_`,
+              timeline: snap.timeline,
+              elapsedMs: snap.elapsedMs,
+              state: snap.state,
+              tokens: snap.tokens,
+              toolCount: snap.toolCount,
+              // actions intentionally omitted — strips buttons
+              chatId: snap.chatId,
+            })
+            await replaceCard(snap.cardId, updatedJson, snap.sequence + 1)
+          } catch (err) {
+            dlog('user_action card.update failed', String(err))
+          } finally {
+            lastFinalizedCard.delete(clickedChatId) // one-shot; no re-click allowed
+          }
+        }
+
+        // Emit channel notification so Claude gets another turn.
         await mcp.notification({
           method: 'notifications/claude/channel',
           params: {
-            content: `用户在上一条回复的卡片上点击了按钮。button_value: "${userActionValue}"`,
+            content: `用户在上一条回复的卡片上点击了按钮 "${clickedLabel}"。button_value: "${userActionValue}"`,
             meta: {
               chat_id: clickedChatId,
               message_type: 'button_click',
               button_value: userActionValue,
+              button_label: clickedLabel,
             },
           },
         })
-        return { toast: { type: 'success', content: '已提交' } }
+        return { toast: { type: 'success', content: `已选择：${clickedLabel}` } }
       }
       if (value?.action === 'cancel_card') {
         // Soft cancel: we can't preempt Claude Code itself, but we can stop
