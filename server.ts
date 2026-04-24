@@ -823,8 +823,17 @@ function placeholderCardJSON(): any {
           element_id: 'footer',
           content: `— ⏱ 0.0s`,
         },
-        // NOTE: V2 schema does not support the `action` element at all
-        // (ErrPath: elements -> action unsupported). Cancel button dropped.
+        // V2 schema: button is a direct element, NOT inside an `action`
+        // container (which V2 dropped). Use `behaviors: [{type:'callback'}]`
+        // for interaction.
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '🛑 停止显示' },
+          type: 'text',
+          behaviors: [
+            { type: 'callback', value: { action: 'cancel_card' } },
+          ],
+        },
       ],
     },
   }
@@ -1188,21 +1197,21 @@ async function sendPermissionCard(
             },
           ],
         },
+        // V2 schema: buttons are direct elements, no `action` wrapper.
         {
-          tag: 'action',
-          actions: [
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: '✅ 批准' },
-              type: 'primary',
-              value: { verdict: 'allow', request_id: requestId },
-            },
-            {
-              tag: 'button',
-              text: { tag: 'plain_text', content: '❌ 拒绝' },
-              type: 'danger',
-              value: { verdict: 'deny', request_id: requestId },
-            },
+          tag: 'button',
+          text: { tag: 'plain_text', content: '✅ 批准' },
+          type: 'primary_filled',
+          behaviors: [
+            { type: 'callback', value: { verdict: 'allow', request_id: requestId } },
+          ],
+        },
+        {
+          tag: 'button',
+          text: { tag: 'plain_text', content: '❌ 拒绝' },
+          type: 'danger_filled',
+          behaviors: [
+            { type: 'callback', value: { verdict: 'deny', request_id: requestId } },
           ],
         },
         {
