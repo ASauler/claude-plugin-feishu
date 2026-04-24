@@ -750,11 +750,8 @@ function placeholderCardJSON(): any {
         {
           tag: 'collapsible_panel',
           expanded: true,
-          background_style: 'grey',
           header: {
-            title: { tag: 'markdown', content: '💭 **过程**' },
-            vertical_align: 'center',
-            icon_position: 'right',
+            title: { tag: 'plain_text', content: '💭 过程' },
           },
           elements: [
             {
@@ -771,13 +768,10 @@ function placeholderCardJSON(): any {
         },
         {
           tag: 'action',
-          element_id: 'cancel',
           actions: [
             {
               tag: 'button',
               text: { tag: 'plain_text', content: '🛑 停止显示' },
-              type: 'text',
-              size: 'small',
               value: { action: 'cancel_card' },
             },
           ],
@@ -819,11 +813,8 @@ function finalCardJSON(params: {
     elements.push({
       tag: 'collapsible_panel',
       expanded: false, // collapsed by default in final state
-      background_style: 'grey',
       header: {
-        title: { tag: 'markdown', content: `💭 **过程** · ${toolCount} 步` },
-        vertical_align: 'center',
-        icon_position: 'right',
+        title: { tag: 'plain_text', content: `💭 过程 · ${toolCount} 步` },
       },
       elements: [
         {
@@ -871,7 +862,7 @@ async function createStreamingCard(): Promise<string | null> {
       },
     })
     const cardId = res?.data?.card_id ?? res?.card_id ?? null
-    dlog('cardkit card.create', { cardId, code: res?.code })
+    dlog('cardkit card.create', { cardId, code: res?.code, msg: res?.msg })
     return cardId
   } catch (err) {
     dlog('cardkit card.create FAILED', String(err))
@@ -1142,11 +1133,8 @@ async function sendPermissionCard(
         {
           tag: 'collapsible_panel',
           expanded: false,
-          background_style: 'grey',
           header: {
-            title: { tag: 'markdown', content: '参数预览' },
-            vertical_align: 'center',
-            icon_position: 'right',
+            title: { tag: 'plain_text', content: '参数预览' },
           },
           elements: [
             {
