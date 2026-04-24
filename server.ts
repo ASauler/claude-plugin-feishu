@@ -1840,32 +1840,25 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
         const clickedLabel = String(value.label ?? userActionValue)
         dlog('user action clicked', { chatId: clickedChatId, value: userActionValue, label: clickedLabel })
 
-        // Rebuild the card without buttons + append "已选择" footer line,
-        // so the user gets visual confirmation and can't double-click.
+        // Build the "post-click" card (no buttons + 已选择 line). We return
+        // this INSIDE the callback response's `card` field — Feishu uses
+        // that as the authoritative post-click card. A separate card.update
+        // gets rolled back by Feishu's own post-callback sync.
+        let updatedCard: any = null
         const snap = lastFinalizedCard.get(clickedChatId)
-        dlog('snap lookup', {
-          chatId: clickedChatId,
-          hasSnap: !!snap,
-          snapKeys: [...lastFinalizedCard.keys()],
-        })
+        dlog('snap lookup', { chatId: clickedChatId, hasSnap: !!snap })
         if (snap) {
-          try {
-            const updatedJson = finalCardJSON({
-              answer: snap.answer + `\n\n✅ _已选择：${clickedLabel}_`,
-              timeline: snap.timeline,
-              elapsedMs: snap.elapsedMs,
-              state: snap.state,
-              tokens: snap.tokens,
-              toolCount: snap.toolCount,
-              // actions intentionally omitted — strips buttons
-              chatId: snap.chatId,
-            })
-            await replaceCard(snap.cardId, updatedJson, snap.sequence + 1)
-          } catch (err) {
-            dlog('user_action card.update failed', String(err))
-          } finally {
-            lastFinalizedCard.delete(clickedChatId) // one-shot; no re-click allowed
-          }
+          updatedCard = finalCardJSON({
+            answer: snap.answer + `\n\n✅ _已选择：${clickedLabel}_`,
+            timeline: snap.timeline,
+            elapsedMs: snap.elapsedMs,
+            state: snap.state,
+            tokens: snap.tokens,
+            toolCount: snap.toolCount,
+            // actions intentionally omitted — strips buttons
+            chatId: snap.chatId,
+          })
+          lastFinalizedCard.delete(clickedChatId)
         }
 
         // Emit channel notification so Claude gets another turn.
@@ -1881,7 +1874,14 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             },
           },
         })
-        return { toast: { type: 'success', content: `已选择：${clickedLabel}` } }
+
+        const response: any = {
+          toast: { type: 'success', content: `已选择：${clickedLabel}` },
+        }
+        if (updatedCard) {
+          response.card = { type: 'raw', data: updatedCard }
+        }
+        return response
       }
       if (value?.action === 'cancel_card') {
         // Soft cancel: we can't preempt Claude Code itself, but we can stop
