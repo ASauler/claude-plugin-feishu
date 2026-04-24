@@ -600,6 +600,13 @@ type CardState = {
   scopeKey?: string           // conversation_id
   userText?: string           // inbound message text (for history)
   senderName?: string         // for history formatting
+  userActions?: ReplyAction[] // Claude-provided buttons to render on finalize
+}
+
+type ReplyAction = {
+  label: string
+  value: string
+  style?: 'primary' | 'danger' | 'default'
 }
 const activeCards = new Map<string, CardState>() // chatId → state
 const sessionChatMap = new Map<string, string>() // sessionId → chatId cache
@@ -851,8 +858,10 @@ function finalCardJSON(params: {
   state: 'done' | 'error'
   tokens: TokenUsage | null
   toolCount: number
+  actions?: ReplyAction[]
+  chatId?: string
 }): any {
-  const { answer, timeline, elapsedMs, state, tokens, toolCount } = params
+  const { answer, timeline, elapsedMs, state, tokens, toolCount, actions, chatId } = params
   const template = state === 'done' ? 'green' : 'red'
   const headerTitle = state === 'done' ? '✨ 沃嫩蝶 · 完成' : '😵 沃嫩蝶 · 失败'
   // In final state the status moves UP into the header; no body status element.
@@ -863,6 +872,31 @@ function finalCardJSON(params: {
       content: answer || '（无输出）',
     },
   ]
+  // Claude-provided action buttons (from reply tool's `actions` param).
+  // Rendered right after the answer so the user sees the choices clearly.
+  if (actions && actions.length > 0) {
+    const styleMap: Record<string, string> = {
+      primary: 'primary_filled',
+      danger: 'danger_filled',
+      default: 'default',
+    }
+    for (const a of actions) {
+      elements.push({
+        tag: 'button',
+        text: { tag: 'plain_text', content: a.label },
+        type: styleMap[a.style ?? 'default'] ?? 'default',
+        behaviors: [
+          {
+            type: 'callback',
+            value: {
+              user_action: a.value,
+              chat_id: chatId ?? '',
+            },
+          },
+        ],
+      })
+    }
+  }
   if (toolCount > 0 && timeline && timeline !== '_等待工具调用…_') {
     elements.push({
       tag: 'collapsible_panel',
@@ -887,10 +921,13 @@ function finalCardJSON(params: {
       (cache ? ` · cache ${formatTokens(cache)}` : '')
     )
   }
+  // Visual separation: hr before the footer line so it reads as a footer,
+  // not as another body paragraph.
+  elements.push({ tag: 'hr' })
   elements.push({
     tag: 'markdown',
     element_id: 'footer',
-    content: `— ${footerParts.join(' · ')}`,
+    content: `⏱ ${(elapsedMs / 1000).toFixed(1)}s${tokens ? '  ·  📊 in ' + formatTokens(tokens.input) + ' · out ' + formatTokens(tokens.output) + (tokens.cacheRead + tokens.cacheWrite ? ' · cache ' + formatTokens(tokens.cacheRead + tokens.cacheWrite) : '') : ''}`,
   })
   return {
     schema: '2.0',
@@ -1147,6 +1184,8 @@ async function finalizeCard(
     state: status,
     tokens: state.tokens,
     toolCount: state.timelineEntries.length,
+    actions: state.userActions,
+    chatId,
   })
   await replaceCard(state.cardId, cardJson, state.sequence++)
   // Release correlation map entry
@@ -1268,7 +1307,11 @@ const mcp = new Server(
       'conversation" (last N turns), then "## Current message" — the actual new input. ' +
       'Use conversation_id to understand which scope you are in.\n\n' +
       'Tools:\n' +
-      '  • reply — ALWAYS use this (not lark_mcp) to respond. chat_id from the tag.\n' +
+      '  • reply — ALWAYS use this (not lark_mcp) to respond. chat_id from the tag. ' +
+      'Optionally pass `actions: [{label, value, style?}]` (0-4 buttons) to render ' +
+      'tappable choices under your reply. When the user taps a button, you will ' +
+      'receive a follow-up channel notification with `meta.message_type="button_click"` ' +
+      'and `meta.button_value=<the value>`. Use that to continue the flow.\n' +
       '  • remember — persist a one-line fact into the current scope memory.md. ' +
       'Use when you learn something durable (user preference, project detail, ' +
       'decision) that would be useful in future turns of this same scope.\n' +
@@ -1289,7 +1332,11 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         'NOT im.v1.message.create or any lark-mcp messaging tool. This tool streams ' +
         'your text into a pre-created card with a native typewriter animation, shows ' +
         'progress/completion states (🧐→⚡→✨), and manages the conversation UX. ' +
-        'Supports lark_md markdown (headings, bold, italic, code blocks, lists, links).',
+        'Supports lark_md markdown (headings, bold, italic, code blocks, lists, links). ' +
+        'Optionally attach `actions` — tappable buttons shown under your reply. When the ' +
+        'user taps one, you will receive a channel notification with the button\'s value, ' +
+        'so you can follow up. Use actions for short choices (2-4 buttons) like "标 done / ' +
+        '跳过 / 重试". Do NOT use actions for free-form input; use plain markdown reply then.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -1302,6 +1349,26 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
             description:
               'Your final reply. Markdown supported (lark_md flavor). ' +
               'Can be long — the card handles rendering.',
+          },
+          actions: {
+            type: 'array',
+            description:
+              'Optional tappable buttons (0-4). Each button becomes a Feishu card ' +
+              'button; clicking it sends you a follow-up channel notification with ' +
+              'the button\'s `value` so you can continue the flow.',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string', description: 'Button text the user sees.' },
+                value: { type: 'string', description: 'Opaque identifier sent back on click.' },
+                style: {
+                  type: 'string',
+                  enum: ['primary', 'danger', 'default'],
+                  description: 'Visual style. primary=blue, danger=red, default=plain.',
+                },
+              },
+              required: ['label', 'value'],
+            },
           },
         },
         required: ['chat_id', 'text'],
@@ -1408,9 +1475,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     }
   }
   if (req.params.name === 'reply') {
-    const { chat_id, text } = req.params.arguments as {
+    const { chat_id, text, actions } = req.params.arguments as {
       chat_id: string
       text: string
+      actions?: ReplyAction[]
     }
     dlog('=== reply tool called ===', {
       chat_id,
@@ -1426,6 +1494,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         dlog('streaming reply into active card', { cardId: state.cardId })
         state.answerBuffer = text
         state.answered = true
+        if (actions && Array.isArray(actions) && actions.length > 0) {
+          state.userActions = actions.slice(0, 4) // hard cap at 4 buttons
+        }
         // Persist this turn (user → assistant) into the scope's history.jsonl.
         if (state.scopeDir && state.userText) {
           const now = Date.now()
@@ -1725,6 +1796,25 @@ const eventDispatcher = new lark.EventDispatcher({}).register({
             content: value.verdict === 'allow' ? '已批准' : '已拒绝',
           },
         }
+      }
+      if (value?.user_action && value?.chat_id) {
+        // Claude-provided button click. Emit as a channel notification so Claude
+        // gets another turn to act on the user's choice.
+        const clickedChatId = String(value.chat_id)
+        const userActionValue = String(value.user_action)
+        dlog('user action clicked', { chatId: clickedChatId, value: userActionValue })
+        await mcp.notification({
+          method: 'notifications/claude/channel',
+          params: {
+            content: `用户在上一条回复的卡片上点击了按钮。button_value: "${userActionValue}"`,
+            meta: {
+              chat_id: clickedChatId,
+              message_type: 'button_click',
+              button_value: userActionValue,
+            },
+          },
+        })
+        return { toast: { type: 'success', content: '已提交' } }
       }
       if (value?.action === 'cancel_card') {
         // Soft cancel: we can't preempt Claude Code itself, but we can stop
