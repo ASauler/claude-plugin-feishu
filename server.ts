@@ -470,11 +470,14 @@ const client = new lark.Client({
   disableTokenCache: false,
 })
 
-const wsClient = new lark.WSClient({
-  appId: APP_ID,
-  appSecret: APP_SECRET,
-  domain: DOMAIN === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
-})
+function makeWSClient(): lark.WSClient {
+  return new lark.WSClient({
+    appId: APP_ID!,
+    appSecret: APP_SECRET!,
+    domain: DOMAIN === 'lark' ? lark.Domain.Lark : lark.Domain.Feishu,
+  })
+}
+let wsClient: lark.WSClient = makeWSClient()
 
 /** Probe bot identity once. Used to strip self-@mentions and skip own messages. */
 let botOpenId = ''
@@ -2124,6 +2127,61 @@ function startHookServer(): void {
 // ---------------------------------------------------------------------------
 // Boot
 // ---------------------------------------------------------------------------
+/**
+ * Tear down the old WS client and start a fresh one. The Feishu node-sdk
+ * sometimes silently loses its WebSocket without the "stop" event firing —
+ * we proactively recycle to recover.
+ */
+async function restartWSClient(reason: string): Promise<void> {
+  dlog(`restarting WS client: ${reason}`)
+  try {
+    if (typeof (wsClient as any).stop === 'function') {
+      await (wsClient as any).stop()
+    }
+  } catch (err) {
+    dlog('old wsClient.stop() error (ignored)', String(err))
+  }
+  wsClient = makeWSClient()
+  try {
+    wsClient.start({ eventDispatcher })
+    dlog('=== ws client re-started ok ===')
+  } catch (err) {
+    dlog('ws client re-start FAILED', String(err))
+  }
+}
+
+/**
+ * Watchdogs: the WS goes silent in the wild without surfacing an error. Two
+ * defenses:
+ *   1) API heartbeat every 60s — catches Feishu/network outages. 3 fails →
+ *      tear down and recreate the WS client.
+ *   2) Scheduled rotation every 3h — defeats silent connection rot even when
+ *      the API is responsive.
+ */
+function startWatchdogs(): void {
+  let apiFailures = 0
+  setInterval(async () => {
+    try {
+      await client.request({ url: '/open-apis/bot/v3/info', method: 'GET' })
+      if (apiFailures > 0) dlog('api heartbeat recovered')
+      apiFailures = 0
+    } catch (err) {
+      apiFailures++
+      dlog(`api heartbeat fail ${apiFailures}/3`, String(err).slice(0, 100))
+      if (apiFailures >= 3) {
+        apiFailures = 0
+        await restartWSClient('api heartbeat exhausted')
+      }
+    }
+  }, 60_000)
+
+  setInterval(() => {
+    restartWSClient('scheduled rotation (3h)').catch(err =>
+      dlog('rotation restart failed', String(err))
+    )
+  }, 3 * 60 * 60 * 1000)
+}
+
 async function main() {
   await probeBotIdentity()
   process.stderr.write(
@@ -2134,6 +2192,8 @@ async function main() {
   // wsClient.start never resolves; don't await.
   wsClient.start({ eventDispatcher })
   process.stderr.write(`feishu channel: WebSocket client started\n`)
+  startWatchdogs()
+  process.stderr.write(`feishu channel: watchdogs armed (60s heartbeat, 3h rotation)\n`)
 }
 
 main().catch(err => {
