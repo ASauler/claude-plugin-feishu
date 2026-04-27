@@ -82,7 +82,13 @@ writeFileSync(PID_FILE, String(process.pid))
 process.on('unhandledRejection', err => {
   dlog(`unhandled rejection: ${err}`)
 })
-process.on('uncaughtException', err => {
+process.on('uncaughtException', (err: any) => {
+  // EPIPE on stdio = Claude Code TUI has died/restarted. Plugin can't reach
+  // its host anymore. Exit cleanly so the TUI can re-spawn us next time.
+  if (err?.code === 'EPIPE' || /EPIPE|ECONNRESET/.test(String(err))) {
+    dlog(`stdio pipe broken (host gone), exiting`)
+    process.exit(0)
+  }
   dlog(`uncaught exception: ${err}`)
 })
 
@@ -601,6 +607,7 @@ type CardState = {
   userText?: string           // inbound message text (for history)
   senderName?: string         // for history formatting
   userActions?: ReplyAction[] // Claude-provided buttons to render on finalize
+  lastSent?: Record<string, string> // element_id → last content; used to skip no-op stream updates
 }
 
 type ReplyAction = {
@@ -1167,15 +1174,22 @@ async function flushCard(chatId: string): Promise<void> {
   const elapsed = ((Date.now() - state.startedAt) / 1000).toFixed(1)
   const footerText = `— ⏱ ${elapsed}s`
 
-  const seqStatus = state.sequence++
-  const seqTimeline = state.sequence++
-  const seqAnswer = state.sequence++
-  const seqFooter = state.sequence++
+  // Build update list. SKIP EMPTY content — Feishu cardElement.content
+  // returns 400 on empty strings during streaming. Also skip values that
+  // haven't changed since last flush to avoid burning API calls.
+  state.lastSent = state.lastSent ?? {}
+  const updates: Array<[string, string]> = []
+  if (statusText && statusText !== state.lastSent.status) updates.push(['status', statusText])
+  if (state.timelineBuffer && state.timelineBuffer !== state.lastSent.timeline) updates.push(['timeline', state.timelineBuffer])
+  const ans = state.answerBuffer || ''
+  if (ans && ans !== state.lastSent.answer) updates.push(['answer', ans])
+  if (footerText && footerText !== state.lastSent.footer) updates.push(['footer', footerText])
 
-  await streamToElement(state.cardId, 'status', statusText, seqStatus)
-  await streamToElement(state.cardId, 'timeline', state.timelineBuffer, seqTimeline)
-  await streamToElement(state.cardId, 'answer', state.answerBuffer || '', seqAnswer)
-  await streamToElement(state.cardId, 'footer', footerText, seqFooter)
+  for (const [id, content] of updates) {
+    const seq = state.sequence++
+    await streamToElement(state.cardId, id, content, seq)
+    state.lastSent[id] = content
+  }
 }
 
 async function finalizeCard(
